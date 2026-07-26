@@ -16,8 +16,11 @@ browser-rs --port 9321         # HTTP MCP: /mcp (streamable) + /sse (legacy)
 browser-rs                     # or stdio
 ```
 
-No npm/Node/Rust needed — the script downloads the prebuilt binary for your
-platform. Alternatives: grab a binary from [Releases](../../releases), or
+No npm/Node/Rust needed on macOS arm64 or Linux x64 — the script downloads the
+prebuilt binary. Other platforms currently build from source. A locally
+installed Google Chrome or Chromium is required; set `AB_CHROME` when it is not
+in a standard location. Alternatives: grab a binary from
+[GitHub Releases](https://github.com/maestrojeong/browser-rs-mcp/releases), or
 `cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp`.
 
 Full instructions (version pinning, direct download, MCP client setup,
@@ -33,6 +36,11 @@ Register with an MCP client:
 //   http://127.0.0.1:9321/mcp?owner=user:group:topic
 // The same owner may instead be sent as X-Browser-Owner.
 ```
+
+Keep HTTP mode on loopback unless you put it behind a trusted authenticated
+proxy. A non-loopback bind requires `AB_HTTP_CAPABILITY`, but the capability
+header does not add TLS or make an ownerless administrative connection safe to
+expose directly.
 
 ## Shared profiles and tab ownership
 
@@ -70,7 +78,7 @@ localhost or behind a trusted proxy.
 | Stealth approach | *patch away* automation tells | *don't create them* — **be a real browser** |
 | Strongest mode | stealth-patched launch | **attach to your own Chrome** (`--connect`) — identical fingerprint |
 | Agent's view | HTML / DOM dump | **accessibility tree + `[ref]`**, act returns a **settle-diff** |
-| Tool surface | ~60 tools | **59 tools** (near-complete parity) |
+| Tool surface | ~60 tools | **62 tools** (near-complete parity) |
 | Transports | stdio + HTTP/SSE | **stdio + HTTP/SSE** (same CLI flags) |
 | Footprint | ~79 MB install, ~182 MB RSS | **~5 MB binary, ~6 MB RSS** |
 | Startup / per-op | baseline | **~100× faster start, ~2–3× per op** |
@@ -105,22 +113,42 @@ Result: **0 detections** on
 [bot.sannysoft.com](https://bot.sannysoft.com), and **0% stealth** on CreepJS —
 all with zero page patching.
 
-## Tools (59)
+## Tools (62)
 
-**Read/see:** `navigate` · `new_page` · `snapshot` · `read` (markdown) ·
-`get_visible_html` · `get_visible_text` · `find` · `take_screenshot` · `save_pdf` · `pages` · `tabs` ·
-`switch_page` · `status`
-**Act (by `ref` or CSS `selector`):** `click` · `type` · `press_key` · `hover` ·
-`select_option` · `fill_form` · `drag` · `file_upload` · `navigate_back` · `wait_for` · `resize` ·
-`evaluate` · `run_code_unsafe` · `iframe_click` · `iframe_fill` · `close_page` · `close`
-**Network:** `network_requests` · `route_block` · `route_clear` ·
-`network_state_set` (offline) · `route_mock` · `api_request`
-**Cookies:** `cookie_{list,get,set,delete,clear}`
-**Web storage:** `localstorage_{list,get,set,delete,clear}` ·
-`sessionstorage_{list,get,set,delete,clear}` · `storage_save` · `storage_load`
-**Diagnostics:** `console_messages` · `fingerprint_check`
-**Dialogs/debug:** `handle_dialog` · `highlight` · `hide_highlight`
-**Auth:** `webauthn` (install a virtual authenticator so passkey prompts don't block; sites fall back to password)
+MCP exposes the exact `browser_*` names below:
+
+**Read/see:** `browser_navigate` · `browser_new_page` · `browser_snapshot` ·
+`browser_read` (markdown) · `browser_get_visible_html` ·
+`browser_get_visible_text` · `browser_find` · `browser_take_screenshot` ·
+`browser_save_pdf` · `browser_pages` · `browser_tabs` · `browser_profile` ·
+`browser_switch_page` · `browser_status`
+
+**Act (by `ref` or CSS `selector`):** `browser_click` · `browser_type` ·
+`browser_press_key` · `browser_hover` · `browser_select_option` ·
+`browser_fill_form` · `browser_drag` · `browser_file_upload` ·
+`browser_navigate_back` · `browser_wait_for` · `browser_resize` ·
+`browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` ·
+`browser_iframe_fill` · `browser_close_page` · `browser_close`
+
+**Network:** `browser_network_requests` · `browser_route_block` ·
+`browser_route_clear` · `browser_network_state_set` (offline) ·
+`browser_route_mock` · `browser_api_request`
+
+**Cookies:** `browser_cookie_{list,get,set,delete,clear}`
+
+**Web storage:** `browser_localstorage_{list,get,set,delete,clear}` ·
+`browser_sessionstorage_{list,get,set,delete,clear}` · `browser_storage_save` ·
+`browser_storage_load`
+
+**Diagnostics:** `browser_console_messages` · `browser_fingerprint_check`
+
+**Dialogs/debug:** `browser_handle_dialog` · `browser_highlight` ·
+`browser_hide_highlight`
+
+**Auth:** `browser_webauthn` installs a virtual authenticator so passkey prompts
+do not block; sites can fall back to password when no credential matches.
+
+**Ownership:** `browser_claim_page` · `browser_release_page`
 
 Act tools take a snapshot `ref` **or** a CSS `selector`, wait for the page to
 settle, and return a **diff of the accessibility tree** — the "did it work"
