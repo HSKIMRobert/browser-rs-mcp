@@ -1,18 +1,46 @@
 # browser-rs
 
-An MCP-only browser server in Rust. It drives a locally installed Chrome or
-Chromium through CDP and exposes browser control to any MCP client. It does not
-bundle an agent, model, or chat UI.
+**One real browser. Many agents. A ~5.5 MB Rust server.**
 
-The main design choices are:
+browser-rs is a lightweight, stealth-oriented browser MCP server. It gives
+multiple agents isolated control of tabs in one shared Chrome process, with 62
+Playwright-style browser tools and no Node.js runtime.
 
-- **Accessibility-first interaction:** snapshots produce a compact tree with
-  `[ref]` values, and action tools return a settle diff for verification.
-- **Raw CDP:** one multiplexed WebSocket handles browser and page sessions.
-- **Real browser defaults:** headful mode, a persistent profile, and no page
-  patching by default. Headless stealth patching is an explicit fallback.
-- **Two transports:** stdio for local clients, or HTTP with streamable MCP and
-  legacy SSE endpoints.
+```mermaid
+flowchart LR
+    A["Agent A<br/>owner=research"] --> M["browser-rs MCP<br/>one Rust process"]
+    B["Agent B<br/>owner=operations"] --> M
+    C["Agent C<br/>owner=qa"] --> M
+    M --> H["one shared Chrome<br/>persistent profile"]
+    H --> T1["research tabs"]
+    H --> T2["operations tabs"]
+    H --> T3["qa tabs"]
+```
+
+## Why browser-rs?
+
+| | browser-rs | Node + Playwright-style stack |
+|---|---:|---:|
+| Server runtime | Single Rust binary | Node.js + npm dependency tree |
+| Release artifact | ~5.5 MB | Runtime and packages installed separately |
+| Server memory¹ | ~6 MB RSS | ~180 MB RSS |
+| Multi-agent control | One Chrome, owner-isolated tab groups | Separate coordination required |
+| Browser control | Raw CDP over one multiplexed WebSocket | Playwright |
+
+¹ Historical maintainer measurements excluding Chrome, taken from idle local
+servers. Exact memory varies by OS, build, runtime, and workload; treat these
+figures as an order-of-magnitude comparison, not a benchmark guarantee. The
+release binary size can be checked with `du -h target/release/browser-rs`.
+
+The default mode uses a locally installed, headful Chrome with a persistent
+profile. It avoids enabling the commonly fingerprinted CDP `Runtime` and
+`Console` domains, evaluates in an isolated world, and does not inject page
+patches. Headless `--stealth` is available as a best-effort fallback.
+
+No browser automation stack can promise universal bot-detection bypass.
+browser-rs minimizes common automation signals and ships reproducible detector
+runners under [`bench/`](./bench) so changes can be tested against current
+browsers and detectors.
 
 ## Install
 
@@ -51,7 +79,7 @@ Use stdio for a client that launches the server:
 browser-rs
 ```
 
-Use HTTP when several clients should share one browser process and profile:
+Use HTTP when several agents should share one browser process and profile:
 
 ```bash
 browser-rs --port 9321
@@ -80,7 +108,7 @@ non-loopback bind requires `AB_HTTP_CAPABILITY`; clients must then send the
 same value in `X-Browser-Capability`. This header is a capability check, not
 TLS or a replacement for authentication.
 
-## Shared profiles and ownership
+## Multi-agent tabs
 
 Each HTTP request can identify its topic, worker, or job with a stable owner:
 
@@ -89,10 +117,11 @@ http://127.0.0.1:9321/mcp?owner=42%3A100%3Aresearch
 X-Browser-Owner: 42:100:research
 ```
 
-New tabs are assigned to the request owner. Page listing, switching, and page
-operations resolve only pages owned by that connection; knowing another
-page's ID is not sufficient to access it. An owner-scoped `browser_close`
-closes that owner's tabs without stopping the shared browser.
+New tabs are assigned to the request owner. Each agent lists, switches, and
+controls only its own tabs, even though every agent shares the same Chrome
+process, login state, and persistent profile. Knowing another owner's page ID
+is not sufficient to access it. An owner-scoped `browser_close` closes only
+that agent's tabs without stopping the browser.
 
 When a topic or job is deleted, close its tabs and mappings explicitly:
 
