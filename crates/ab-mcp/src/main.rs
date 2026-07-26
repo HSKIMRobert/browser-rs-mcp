@@ -28,7 +28,7 @@ Loop: browser_navigate -> browser_snapshot -> act (click/type) -> re-snapshot to
 - act on them by ref with browser_click / browser_type / browser_press_key.
 - refs go stale when the page changes — re-snapshot before reusing them.
 - browser_evaluate runs one-shot JS; browser_take_screenshot saves a PNG.
-Stealth: this browser never enables the detectable CDP domains (no Runtime.enable)."#;
+Stealth: default paths avoid Runtime.enable; browser_console_messages opts in on first use."#;
 
 tokio::task_local! {
     static REQUEST_OWNER: Option<String>;

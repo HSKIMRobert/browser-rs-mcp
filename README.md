@@ -33,9 +33,11 @@ figures as an order-of-magnitude comparison, not a benchmark guarantee. The
 release binary size can be checked with `du -h target/release/browser-rs`.
 
 The default mode uses a locally installed, headful Chrome with a persistent
-profile. It avoids enabling the commonly fingerprinted CDP `Runtime` and
-`Console` domains, evaluates in an isolated world, and does not inject page
-patches. Headless `--stealth` is available as a best-effort fallback.
+profile and does not inject page patches. Default interaction paths avoid the
+commonly fingerprinted CDP `Runtime` and `Console` domains.
+`browser_evaluate` uses an isolated world unless `main_world=true` is requested;
+`browser_console_messages` opts into `Runtime.enable` on first use. Headless
+`--stealth` is available as a best-effort fallback.
 
 No browser automation stack can promise universal bot-detection bypass.
 browser-rs minimizes common automation signals and ships reproducible detector
@@ -121,7 +123,8 @@ New tabs are assigned to the request owner. Each agent lists, switches, and
 controls only its own tabs, even though every agent shares the same Chrome
 process, login state, and persistent profile. Knowing another owner's page ID
 is not sufficient to access it. An owner-scoped `browser_close` closes only
-that agent's tabs without stopping the browser.
+that agent's tabs without stopping the browser. Owner isolation is an
+in-process scope, not an authentication boundary.
 
 When a topic or job is deleted, close its tabs and mappings explicitly:
 
