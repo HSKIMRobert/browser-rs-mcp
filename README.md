@@ -2,9 +2,16 @@
 
 **One real browser. Many agents. A ~5.5 MB Rust server.**
 
-browser-rs is a lightweight, stealth-oriented browser MCP server. It gives
-multiple agents isolated control of tabs in one shared Chrome process, with 62
-Playwright-style browser tools and no Node.js runtime.
+[![ci](https://github.com/maestrojeong/browser-rs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/maestrojeong/browser-rs-mcp/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/maestrojeong/browser-rs-mcp)](https://github.com/maestrojeong/browser-rs-mcp/releases)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+![platforms](https://img.shields.io/badge/platforms-macOS%20arm64%20%C2%B7%20Linux%20x64-lightgrey)
+
+browser-rs is a lightweight, stealth-oriented browser MCP server. It lets
+multiple AI agents share one logged-in Chrome — each agent controls only its
+own tabs — for parallel scraping, web automation, and QA without every agent
+spinning up its own browser. 62 Playwright-style tools, one Rust binary, no
+Node.js runtime.
 
 ```mermaid
 flowchart LR
@@ -19,75 +26,64 @@ flowchart LR
 
 ## Why browser-rs?
 
-| | browser-rs | Node + Playwright-style stack |
-|---|---:|---:|
+| | browser-rs | Playwright/Puppeteer-based MCP (Node) |
+|---|:--|:--|
 | Server runtime | Single Rust binary | Node.js + npm dependency tree |
 | Release artifact | ~5.5 MB | Runtime and packages installed separately |
 | Server memory¹ | ~6 MB RSS | ~180 MB RSS |
 | Multi-agent control | One Chrome, owner-isolated tab groups | Separate coordination required |
 | Browser control | Raw CDP over one multiplexed WebSocket | Playwright |
 
+The default mode uses a locally installed, headful Chrome with a persistent
+profile and does not inject page patches, minimizing common automation signals.
+It does **not** guarantee bot-detection bypass — no automation stack can — but
+ships reproducible detector runners under [`bench/`](./bench) so changes can be
+tested against current browsers and detectors. See [DESIGN.md](DESIGN.md) for
+how the stealth defaults work.
+
 ¹ Historical maintainer measurements excluding Chrome, taken from idle local
 servers. Exact memory varies by OS, build, runtime, and workload; treat these
 figures as an order-of-magnitude comparison, not a benchmark guarantee. The
 release binary size can be checked with `du -h target/release/browser-rs`.
 
-The default mode uses a locally installed, headful Chrome with a persistent
-profile and does not inject page patches. Default interaction paths avoid the
-commonly fingerprinted CDP `Runtime` and `Console` domains.
-`browser_evaluate` uses an isolated world unless `main_world=true` is requested;
-`browser_console_messages` opts into `Runtime.enable` on first use. Headless
-`--stealth` is available as a best-effort fallback.
+## Quick start
 
-No browser automation stack can promise universal bot-detection bypass.
-browser-rs minimizes common automation signals and ships reproducible detector
-runners under [`bench/`](./bench) so changes can be tested against current
-browsers and detectors.
-
-## Install
-
-On macOS arm64 and Linux x64, the installer downloads a prebuilt binary. A
-locally installed Google Chrome or Chromium is also required.
+**1. Install** — on macOS arm64 and Linux x64 the installer downloads a
+prebuilt binary. A locally installed Google Chrome or Chromium is also required.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
 browser-rs --help
 ```
 
-The installer uses `/usr/local/bin`, or `~/.local/bin` when the former is not
-writable. Set `AB_BIN_DIR` to choose another directory and `AB_VERSION` to pin
-a release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh \
-  | AB_VERSION=v0.1.12 AB_BIN_DIR="$HOME/bin" sh
-```
-
-Other options are listed in **[INSTALL.md](INSTALL.md)**, including direct
-downloads, SHA-256 files, source installation, and updating a running binary.
-Build from source with:
-
-```bash
-cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
-```
-
-Set `AB_CHROME` when Chrome is not in a standard location if needed.
-
-## Start and connect
-
-Use stdio for a client that launches the server:
+**2. Run** — use stdio for a client that launches the server:
 
 ```bash
 browser-rs
 ```
 
-Use HTTP when several agents should share one browser process and profile:
+**3. Verify** — point an MCP client at it and drive the browser:
+
+```text
+browser_navigate  → https://example.com   # a headful Chrome window opens
+browser_snapshot                          # returns the accessibility tree
+```
+
+The common workflow is: `browser_snapshot`, act, then inspect the returned
+accessibility diff. Most interaction tools accept a snapshot `ref` or a CSS
+selector.
+
+Other install options — direct downloads, SHA-256 files, source builds, and
+updating a running binary — are in **[INSTALL.md](INSTALL.md)**. To build from
+source:
 
 ```bash
-browser-rs --port 9321
-# streamable HTTP: http://127.0.0.1:9321/mcp
-# legacy SSE:      http://127.0.0.1:9321/sse
+cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 ```
+
+Set `AB_CHROME` if Chrome is not in a standard location.
+
+## Connect an MCP client
 
 Example stdio configuration:
 
@@ -101,41 +97,32 @@ Example stdio configuration:
 }
 ```
 
-For HTTP, configure the client with `http://127.0.0.1:9321/mcp` for streamable
-HTTP, or `/sse` for clients that still use legacy SSE. See
-**[INSTALL.md](INSTALL.md)** for client-specific examples.
+Use HTTP when several agents should share one browser process and profile:
 
-Keep HTTP on loopback unless it is behind a trusted, authenticated proxy. A
-non-loopback bind requires `AB_HTTP_CAPABILITY`; clients must then send the
-same value in `X-Browser-Capability`. This header is a capability check, not
-TLS or a replacement for authentication.
+```bash
+browser-rs --port 9321
+# streamable HTTP: http://127.0.0.1:9321/mcp
+# legacy SSE:      http://127.0.0.1:9321/sse
+```
+
+Configure the client with `http://127.0.0.1:9321/mcp` for streamable HTTP, or
+`/sse` for clients that still use legacy SSE. Keep HTTP on loopback unless it is
+behind a trusted, authenticated proxy; non-loopback binds and the
+`X-Browser-Capability` header are covered in **[INSTALL.md](INSTALL.md)**.
 
 ## Multi-agent tabs
 
-Each HTTP request can identify its topic, worker, or job with a stable owner:
+Each HTTP request identifies its topic, worker, or job with a stable owner (via
+an `?owner=` query param or the `X-Browser-Owner` header). New tabs are assigned
+to the request owner, and each agent lists, switches, and controls only its own
+tabs — even though every agent shares the same Chrome process, login state, and
+persistent profile. An owner-scoped `browser_close` closes only that agent's
+tabs without stopping the browser.
 
-```text
-http://127.0.0.1:9321/mcp?owner=42%3A100%3Aresearch
-X-Browser-Owner: 42:100:research
-```
-
-New tabs are assigned to the request owner. Each agent lists, switches, and
-controls only its own tabs, even though every agent shares the same Chrome
-process, login state, and persistent profile. Knowing another owner's page ID
-is not sufficient to access it. An owner-scoped `browser_close` closes only
-that agent's tabs without stopping the browser. Owner isolation is an
-in-process scope, not an authentication boundary.
-
-When a topic or job is deleted, close its tabs and mappings explicitly:
-
-```bash
-curl -X DELETE \
-  'http://127.0.0.1:9321/owners?owner=42%3A100%3Aresearch'
-```
-
-This does not delete the browser profile or affect other owners. Connections
-without an owner are administrative and can access all tabs, so do not expose
-an ownerless HTTP endpoint publicly.
+Owner isolation is an in-process scope, not an authentication boundary.
+Connections without an owner are administrative and can access all tabs, so do
+not expose an ownerless HTTP endpoint publicly. Owner setup, per-owner cleanup,
+and capability-header details are in **[INSTALL.md](INSTALL.md)**.
 
 ## Tools
 
@@ -150,9 +137,6 @@ MCP exposes 62 `browser_*` tools:
 **Cookies and storage:** `browser_cookie_list` · `browser_cookie_get` · `browser_cookie_set` · `browser_cookie_delete` · `browser_cookie_clear` · `browser_localstorage_list` · `browser_localstorage_get` · `browser_localstorage_set` · `browser_localstorage_delete` · `browser_localstorage_clear` · `browser_sessionstorage_list` · `browser_sessionstorage_get` · `browser_sessionstorage_set` · `browser_sessionstorage_delete` · `browser_sessionstorage_clear` · `browser_storage_save` · `browser_storage_load`
 
 **Diagnostics and page utilities:** `browser_console_messages` · `browser_fingerprint_check` · `browser_handle_dialog` · `browser_highlight` · `browser_hide_highlight` · `browser_webauthn` · `browser_claim_page` · `browser_release_page`
-
-Most interaction tools accept a snapshot `ref` or a CSS selector. The common
-workflow is: snapshot, act, then inspect the returned accessibility diff.
 
 ## CLI and environment
 
@@ -205,7 +189,8 @@ See [DESIGN.md](DESIGN.md) for architecture and tradeoffs. The source is
 organized into `ab-cdp` (CDP transport), `ab-browser` (browser and page logic),
 and `ab-mcp` (the MCP server).
 
-## Release
+<details>
+<summary><strong>Release (maintainers)</strong></summary>
 
 Update `workspace.package.version` in `Cargo.toml`, then commit and tag:
 
@@ -218,6 +203,8 @@ git push origin main vX.Y.Z
 The `v*` tag workflow builds macOS arm64 and Linux x64 binaries, publishes
 SHA-256 files, and attaches them to the GitHub Release. `install.sh` fetches the
 latest release by default; set `AB_VERSION=vX.Y.Z` to pin one.
+
+</details>
 
 ## License
 
