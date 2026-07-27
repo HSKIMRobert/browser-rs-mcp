@@ -332,6 +332,7 @@ impl Browser {
             client: self.client.clone(),
             session_id,
             target_id: target_id.to_string(),
+            #[cfg(target_os = "macos")]
             browser_pid: self.child.as_ref().and_then(Child::id),
             pointer: Arc::new(Mutex::new(None)),
             dialog: Arc::new(Mutex::new((true, None))),
@@ -374,6 +375,7 @@ pub struct Page {
     target_id: String,
     /// Browser process launched by this crate. Used only for a best-effort
     /// macOS foreground fallback; externally connected browsers leave it unset.
+    #[cfg(target_os = "macos")]
     browser_pid: Option<u32>,
     /// Last known pointer position (shared across clones of this page) so mouse
     /// motion is *continuous* — the next move starts where the last one ended,
