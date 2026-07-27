@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ab_cdp::CdpClient;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 use tracing::{debug, info};
@@ -89,6 +90,15 @@ pub enum BrowserError {
 }
 
 pub type Result<T> = std::result::Result<T, BrowserError>;
+
+/// Verified state after bringing a page target to the foreground.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageActivation {
+    pub activated: bool,
+    pub visibility: String,
+    pub window_focused: bool,
+    pub attempts: u8,
+}
 
 #[derive(Debug, Clone)]
 pub struct LaunchOptions {
@@ -322,6 +332,7 @@ impl Browser {
             client: self.client.clone(),
             session_id,
             target_id: target_id.to_string(),
+            browser_pid: self.child.as_ref().and_then(Child::id),
             pointer: Arc::new(Mutex::new(None)),
             dialog: Arc::new(Mutex::new((true, None))),
             routes: Arc::new(Mutex::new(RouteState::default())),
@@ -361,6 +372,9 @@ pub struct Page {
     client: CdpClient,
     session_id: String,
     target_id: String,
+    /// Browser process launched by this crate. Used only for a best-effort
+    /// macOS foreground fallback; externally connected browsers leave it unset.
+    browser_pid: Option<u32>,
     /// Last known pointer position (shared across clones of this page) so mouse
     /// motion is *continuous* — the next move starts where the last one ended,
     /// instead of teleporting to a fresh random origin every click.
@@ -383,6 +397,81 @@ impl Page {
             .await?;
         Ok(())
     }
+
+    /// Bring this target to the foreground and verify the document is visible.
+    ///
+    /// `Target.activateTarget` is the canonical CDP operation. On macOS, when
+    /// this crate launched Chrome and CDP activation alone did not focus the
+    /// window, a best-effort process-level foreground request is made before
+    /// retrying. Externally connected browsers are never guessed by app name.
+    pub async fn activate(&self) -> Result<PageActivation> {
+        let mut visibility = String::from("unknown");
+        let mut window_focused = false;
+
+        for attempts in 1..=3_u8 {
+            self.client
+                .send(
+                    "Target.activateTarget",
+                    json!({ "targetId": self.target_id }),
+                )
+                .await?;
+
+            if attempts > 1 {
+                self.bring_browser_process_to_front().await;
+            }
+            tokio::time::sleep(Duration::from_millis(100 * u64::from(attempts))).await;
+
+            let state = self
+                .evaluate(
+                    "({visibility: document.visibilityState, windowFocused: document.hasFocus()})",
+                )
+                .await?;
+            visibility = state
+                .get("visibility")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            window_focused = state
+                .get("windowFocused")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            if visibility == "visible" && window_focused {
+                return Ok(PageActivation {
+                    activated: true,
+                    visibility,
+                    window_focused,
+                    attempts,
+                });
+            }
+        }
+
+        Ok(PageActivation {
+            activated: visibility == "visible",
+            visibility,
+            window_focused,
+            attempts: 3,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn bring_browser_process_to_front(&self) {
+        let Some(pid) = self.browser_pid else {
+            return;
+        };
+        let script = format!(
+            "tell application \"System Events\" to set frontmost of first process whose unix id is {pid} to true"
+        );
+        let _ = Command::new("osascript")
+            .args(["-e", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn bring_browser_process_to_front(&self) {}
 
     async fn init_stealth(&self) -> Result<()> {
         // Inject before any page script. Does NOT require Runtime.enable.
@@ -889,6 +978,29 @@ impl Page {
             )
             .await?;
         *self.pointer.lock().unwrap() = Some((x, y));
+        Ok(())
+    }
+
+    /// Dispatch a real CDP mouse-wheel event at viewport coordinates.
+    ///
+    /// This intentionally does not use DOM scrolling APIs: sites receive the
+    /// same `mouseWheel` input path as physical trackpad/mouse scrolling.
+    pub async fn wheel(&self, delta_y: f64, x: f64, y: f64) -> Result<()> {
+        self.human_move_to(x, y).await?;
+        self.client
+            .send_on(
+                &self.session_id,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseWheel",
+                    "x": x,
+                    "y": y,
+                    "deltaX": 0.0,
+                    "deltaY": delta_y,
+                }),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(rand_u64(30, 80))).await;
         Ok(())
     }
 

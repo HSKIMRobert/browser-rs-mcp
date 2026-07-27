@@ -10,7 +10,7 @@
 browser-rs is a lightweight, stealth-oriented browser MCP server. It lets
 multiple AI agents share one logged-in Chrome — each agent controls only its
 own tabs — for parallel scraping, web automation, and QA without every agent
-spinning up its own browser. 62 Playwright-style tools, one Rust binary, no
+spinning up its own browser. 64 Playwright-style tools, one Rust binary, no
 Node.js runtime.
 
 ```mermaid
@@ -126,11 +126,18 @@ and capability-header details are in **[INSTALL.md](INSTALL.md)**.
 
 ## Tools
 
-MCP exposes 62 `browser_*` tools:
+MCP exposes 64 `browser_*` tools:
 
-**Navigation and inspection:** `browser_navigate` · `browser_new_page` · `browser_snapshot` · `browser_read` · `browser_get_visible_html` · `browser_get_visible_text` · `browser_find` · `browser_take_screenshot` · `browser_save_pdf` · `browser_pages` · `browser_tabs` · `browser_switch_page` · `browser_profile` · `browser_status`
+**Navigation and inspection:** `browser_navigate` · `browser_new_page` · `browser_snapshot` · `browser_activate_page` · `browser_read` · `browser_get_visible_html` · `browser_get_visible_text` · `browser_find` · `browser_take_screenshot` · `browser_save_pdf` · `browser_pages` · `browser_tabs` · `browser_switch_page` · `browser_profile` · `browser_status`
 
-**Interaction:** `browser_click` · `browser_type` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_close_page` · `browser_close`
+**Interaction:** `browser_click` · `browser_wheel` · `browser_type` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_close_page` · `browser_close`
+
+Use `browser_activate_page({ "page": "p5" })` before automating a background
+tab whose site throttles lazy loading. It calls CDP `Target.activateTarget`,
+retries visibility/focus verification, and uses a process-specific macOS
+foreground fallback when browser-rs launched Chrome itself. Use
+`browser_wheel({ "page": "p5", "delta_y": 700, "x": 650, "y": 500 })` for a
+real CDP `mouseWheel` event instead of DOM `window.scrollBy()`.
 
 **Network and requests:** `browser_network_requests` · `browser_route_block` · `browser_route_mock` · `browser_route_clear` · `browser_network_state_set` · `browser_api_request`
 

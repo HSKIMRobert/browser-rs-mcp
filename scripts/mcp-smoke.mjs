@@ -43,7 +43,14 @@ console.log("initialize:", init.result?.serverInfo?.name, "| tools cap:", !!init
 notify("notifications/initialized", {});
 
 const tools = await send("tools/list", {});
-console.log("tools:", tools.result.tools.map((t) => t.name).join(", "));
+const toolNames = tools.result.tools.map((t) => t.name);
+console.log("tools:", toolNames.join(", "));
+for (const required of ["browser_activate_page", "browser_wheel"]) {
+  if (!toolNames.includes(required)) {
+    child.kill();
+    throw new Error(`missing tool: ${required}`);
+  }
+}
 
 const nav = await send("tools/call", {
   name: "browser_navigate",
@@ -52,6 +59,34 @@ const nav = await send("tools/call", {
 const text = nav.result?.content?.[0]?.text || JSON.stringify(nav.error);
 console.log("--- browser_navigate result ---");
 console.log(text.split("\n").slice(0, 12).join("\n"));
+
+const activated = await send("tools/call", {
+  name: "browser_activate_page",
+  arguments: { page: "p1" },
+});
+console.log("--- browser_activate_page ---");
+console.log(activated.result?.content?.[0]?.text || JSON.stringify(activated.error));
+
+await send("tools/call", {
+  name: "browser_evaluate",
+  arguments: { page: "p1", expression: "document.body.style.minHeight='3000px'; 0" },
+});
+const wheel = await send("tools/call", {
+  name: "browser_wheel",
+  arguments: { page: "p1", delta_y: 300, x: 640, y: 400 },
+});
+console.log("--- browser_wheel ---");
+console.log(wheel.result?.content?.[0]?.text || JSON.stringify(wheel.error));
+const scrollY = await send("tools/call", {
+  name: "browser_evaluate",
+  arguments: { page: "p1", expression: "scrollY" },
+});
+const scrollValue = Number(scrollY.result?.content?.[0]?.text);
+if (!(scrollValue > 0)) {
+  child.kill();
+  throw new Error(`mouseWheel did not move the page: scrollY=${scrollValue}`);
+}
+console.log("scrollY after mouseWheel:", scrollValue);
 
 // act: click the first ref, then re-snapshot to verify navigation.
 const click = await send("tools/call", {

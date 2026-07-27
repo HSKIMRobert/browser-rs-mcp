@@ -26,6 +26,8 @@ const INSTRUCTIONS: &str = r#"browser-rs — a real Chrome driven over CDP, no b
 Loop: browser_navigate -> browser_snapshot -> act (click/type) -> re-snapshot to verify.
 - snapshot renders the page as an accessibility tree; interactive nodes carry [ref=eN] handles.
 - act on them by ref with browser_click / browser_type / browser_press_key.
+- browser_activate_page explicitly foregrounds a tab and verifies visibility.
+- browser_wheel sends native CDP mouse-wheel input for lazy-loaded feeds.
 - refs go stale when the page changes — re-snapshot before reusing them.
 - browser_evaluate runs one-shot JS; browser_take_screenshot saves a PNG.
 Stealth: default paths avoid Runtime.enable; browser_console_messages opts in on first use."#;
@@ -163,6 +165,18 @@ struct FindArgs {
 struct PageArg {
     /// Page id (e.g. "p1") or owner alias from browser_claim_page.
     page: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WheelArgs {
+    /// Page id (e.g. "p1") or owner alias from browser_claim_page.
+    page: String,
+    /// Vertical wheel delta in CSS pixels. Positive scrolls down.
+    delta_y: f64,
+    /// Viewport x coordinate where the wheel event is dispatched.
+    x: f64,
+    /// Viewport y coordinate where the wheel event is dispatched.
+    y: f64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -867,6 +881,25 @@ impl BrowserServer {
         Ok(ok(format!("page {}\n\n{}", a.page, snap.text)))
     }
 
+    /// Activate a page target and verify foreground/visibility state.
+    #[tool(description = "Bring a page tab to the foreground and verify document visibility/focus")]
+    async fn browser_activate_page(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let page_id = self.canonical_page_id(&a.page).await?;
+        let page = self.page_of(&page_id).await?;
+        let activation = page.activate().await.map_err(fail)?;
+        Ok(ok(serde_json::to_string_pretty(&serde_json::json!({
+            "page": page_id,
+            "activated": activation.activated,
+            "visibility": activation.visibility,
+            "window_focused": activation.window_focused,
+            "attempts": activation.attempts,
+        }))
+        .unwrap_or_else(|_| "{}".into())))
+    }
+
     /// Click an element by its snapshot ref, then report what changed.
     #[tool(description = "Click an element by ref (synthesized mouse click); returns settle-diff")]
     async fn browser_click(
@@ -878,6 +911,36 @@ impl BrowserServer {
         page.click(backend).await.map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
         Ok(ok(format!("clicked on {}\n\n{}", a.page, diff)))
+    }
+
+    /// Send a native CDP mouse-wheel event at viewport coordinates.
+    #[tool(
+        description = "Scroll with a real CDP mouseWheel event at viewport coordinates; returns settle-diff"
+    )]
+    async fn browser_wheel(
+        &self,
+        Parameters(a): Parameters<WheelArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if !a.delta_y.is_finite() || !a.x.is_finite() || !a.y.is_finite() {
+            return Err(fail("delta_y, x, and y must be finite numbers"));
+        }
+        if a.x < 0.0 || a.y < 0.0 {
+            return Err(fail("x and y must be non-negative viewport coordinates"));
+        }
+
+        let page_id = self.canonical_page_id(&a.page).await?;
+        let page = self.page_of(&page_id).await?;
+        page.wheel(a.delta_y, a.x, a.y).await.map_err(fail)?;
+        let diff = self.settle_diff(&page_id, &page).await?;
+        Ok(ok(serde_json::to_string_pretty(&serde_json::json!({
+            "page": page_id,
+            "dispatched": true,
+            "delta_y": a.delta_y,
+            "x": a.x,
+            "y": a.y,
+            "diff": diff,
+        }))
+        .unwrap_or_else(|_| "{}".into())))
     }
 
     /// Type text into an element by ref (optionally clearing it first).
@@ -2051,8 +2114,8 @@ Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_STEALT
 mod tests {
     use super::{
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner, parse_cli_from,
-        parse_connect_port, release_owner_claim, webauthn_options_match_automatic_defaults, State,
-        REQUEST_OWNER,
+        parse_connect_port, release_owner_claim, webauthn_options_match_automatic_defaults,
+        BrowserServer, State, REQUEST_OWNER,
     };
 
     #[test]
@@ -2138,6 +2201,17 @@ mod tests {
         assert!(!webauthn_options_match_automatic_defaults(
             "internal", true, false
         ));
+    }
+
+    #[test]
+    fn foreground_and_wheel_tools_are_publicly_registered() {
+        let tools = BrowserServer::new().tool_router.list_all();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"browser_activate_page"));
+        assert!(names.contains(&"browser_wheel"));
     }
 }
 
