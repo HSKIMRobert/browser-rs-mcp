@@ -446,7 +446,7 @@ impl Page {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
-            if visibility == "visible" && window_focused {
+            if activation_verified(&visibility, window_focused) {
                 return Ok(PageActivation {
                     activated: true,
                     visibility,
@@ -457,7 +457,7 @@ impl Page {
         }
 
         Ok(PageActivation {
-            activated: visibility == "visible",
+            activated: activation_verified(&visibility, window_focused),
             visibility,
             window_focused,
             attempts: 3,
@@ -2128,6 +2128,10 @@ impl Page {
     }
 }
 
+fn activation_verified(visibility: &str, window_focused: bool) -> bool {
+    visibility == "visible" && window_focused
+}
+
 /// Persistent per-user profile directory (aged profiles look human). Override
 /// with `AB_PROFILE`. We deliberately avoid a throwaway temp dir.
 fn default_profile_dir() -> Result<PathBuf> {
@@ -2265,4 +2269,16 @@ async fn discover_ws_url(port: u16) -> Result<String> {
     Err(BrowserError::Discovery(format!(
         "no webSocketDebuggerUrl at {url}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::activation_verified;
+
+    #[test]
+    fn activation_requires_visible_and_focused_document() {
+        assert!(activation_verified("visible", true));
+        assert!(!activation_verified("visible", false));
+        assert!(!activation_verified("hidden", true));
+    }
 }

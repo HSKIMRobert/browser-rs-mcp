@@ -2140,6 +2140,30 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn scoped_page_resolution_blocks_other_owners_for_activation_and_wheel() {
+        let mut state = State::default();
+        state.owners.insert("owner-a".into(), "p1".into());
+        state.owners.insert("owner-b".into(), "p2".into());
+        state.page_owners.insert("p1".into(), "owner-a".into());
+        state.page_owners.insert("p2".into(), "owner-b".into());
+
+        REQUEST_OWNER
+            .scope(Some("owner-a".to_string()), async {
+                assert_eq!(
+                    BrowserServer::resolve_page_id(&state, "owner-a"),
+                    Some("p1".into())
+                );
+                assert_eq!(
+                    BrowserServer::resolve_page_id(&state, "p1"),
+                    Some("p1".into())
+                );
+                assert_eq!(BrowserServer::resolve_page_id(&state, "owner-b"), None);
+                assert_eq!(BrowserServer::resolve_page_id(&state, "p2"), None);
+            })
+            .await;
+    }
+
     #[test]
     fn scoped_release_preserves_durable_page_ownership() {
         let mut state = State::default();
