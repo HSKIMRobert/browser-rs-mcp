@@ -421,11 +421,21 @@ impl Page {
             }
             tokio::time::sleep(Duration::from_millis(100 * u64::from(attempts))).await;
 
-            let state = self
+            let state = match self
                 .evaluate(
                     "({visibility: document.visibilityState, windowFocused: document.hasFocus()})",
                 )
-                .await?;
+                .await
+            {
+                Ok(state) => state,
+                Err(error) if attempts < 3 => {
+                    debug!(
+                        "page activation visibility check failed on attempt {attempts}: {error}"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             visibility = state
                 .get("visibility")
                 .and_then(Value::as_str)
