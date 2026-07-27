@@ -499,6 +499,16 @@ fn fail<E: std::fmt::Display>(e: E) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
+fn validate_wheel_input(delta_y: f64, x: f64, y: f64) -> Result<(), &'static str> {
+    if !delta_y.is_finite() || !x.is_finite() || !y.is_finite() {
+        return Err("delta_y, x, and y must be finite numbers");
+    }
+    if x < 0.0 || y < 0.0 {
+        return Err("x and y must be non-negative viewport coordinates");
+    }
+    Ok(())
+}
+
 impl BrowserServer {
     fn new() -> Self {
         Self::with_state(Arc::new(Mutex::new(State::default())))
@@ -921,12 +931,7 @@ impl BrowserServer {
         &self,
         Parameters(a): Parameters<WheelArgs>,
     ) -> Result<CallToolResult, McpError> {
-        if !a.delta_y.is_finite() || !a.x.is_finite() || !a.y.is_finite() {
-            return Err(fail("delta_y, x, and y must be finite numbers"));
-        }
-        if a.x < 0.0 || a.y < 0.0 {
-            return Err(fail("x and y must be non-negative viewport coordinates"));
-        }
+        validate_wheel_input(a.delta_y, a.x, a.y).map_err(fail)?;
 
         let page_id = self.canonical_page_id(&a.page).await?;
         let page = self.page_of(&page_id).await?;
@@ -2114,8 +2119,8 @@ Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_STEALT
 mod tests {
     use super::{
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner, parse_cli_from,
-        parse_connect_port, release_owner_claim, webauthn_options_match_automatic_defaults,
-        BrowserServer, State, REQUEST_OWNER,
+        parse_connect_port, release_owner_claim, validate_wheel_input,
+        webauthn_options_match_automatic_defaults, BrowserServer, State, REQUEST_OWNER,
     };
 
     #[test]
@@ -2212,6 +2217,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"browser_activate_page"));
         assert!(names.contains(&"browser_wheel"));
+    }
+
+    #[test]
+    fn wheel_input_rejects_invalid_coordinates_and_non_finite_numbers() {
+        assert!(validate_wheel_input(700.0, 650.0, 500.0).is_ok());
+        assert!(validate_wheel_input(-700.0, 650.0, 500.0).is_ok());
+        assert!(validate_wheel_input(700.0, -1.0, 500.0).is_err());
+        assert!(validate_wheel_input(700.0, 650.0, -1.0).is_err());
+        assert!(validate_wheel_input(f64::INFINITY, 650.0, 500.0).is_err());
+        assert!(validate_wheel_input(700.0, f64::NAN, 500.0).is_err());
     }
 }
 
