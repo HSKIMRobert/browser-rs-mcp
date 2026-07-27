@@ -28,6 +28,14 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
+      - name: Verify release tag matches package version
+        run: |
+          version="$(cargo pkgid -p ab-mcp | sed -E 's/.*[#@]//')"
+          test "v${version}" = "${GITHUB_REF_NAME}" || {
+            echo "release tag ${GITHUB_REF_NAME} does not match ab-mcp version v${version}" >&2
+            exit 1
+          }
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p ab-mcp
 

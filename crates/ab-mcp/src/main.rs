@@ -26,6 +26,8 @@ const INSTRUCTIONS: &str = r#"browser-rs — a real Chrome driven over CDP, no b
 Loop: browser_navigate -> browser_snapshot -> act (click/type) -> re-snapshot to verify.
 - snapshot renders the page as an accessibility tree; interactive nodes carry [ref=eN] handles.
 - act on them by ref with browser_click / browser_type / browser_press_key.
+- browser_activate_page explicitly foregrounds a tab and verifies visibility.
+- browser_wheel sends native CDP mouse-wheel input for lazy-loaded feeds.
 - refs go stale when the page changes — re-snapshot before reusing them.
 - browser_evaluate runs one-shot JS; browser_take_screenshot saves a PNG.
 Stealth: default paths avoid Runtime.enable; browser_console_messages opts in on first use."#;
@@ -163,6 +165,18 @@ struct FindArgs {
 struct PageArg {
     /// Page id (e.g. "p1") or owner alias from browser_claim_page.
     page: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WheelArgs {
+    /// Page id (e.g. "p1") or owner alias from browser_claim_page.
+    page: String,
+    /// Vertical wheel delta in CSS pixels. Positive scrolls down.
+    delta_y: f64,
+    /// Viewport x coordinate where the wheel event is dispatched.
+    x: f64,
+    /// Viewport y coordinate where the wheel event is dispatched.
+    y: f64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -483,6 +497,16 @@ fn ok(s: impl Into<String>) -> CallToolResult {
 
 fn fail<E: std::fmt::Display>(e: E) -> McpError {
     McpError::internal_error(e.to_string(), None)
+}
+
+fn validate_wheel_input(delta_y: f64, x: f64, y: f64) -> Result<(), &'static str> {
+    if !delta_y.is_finite() || !x.is_finite() || !y.is_finite() {
+        return Err("delta_y, x, and y must be finite numbers");
+    }
+    if x < 0.0 || y < 0.0 {
+        return Err("x and y must be non-negative viewport coordinates");
+    }
+    Ok(())
 }
 
 impl BrowserServer {
@@ -867,6 +891,25 @@ impl BrowserServer {
         Ok(ok(format!("page {}\n\n{}", a.page, snap.text)))
     }
 
+    /// Activate a page target and verify foreground/visibility state.
+    #[tool(description = "Bring a page tab to the foreground and verify document visibility/focus")]
+    async fn browser_activate_page(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let page_id = self.canonical_page_id(&a.page).await?;
+        let page = self.page_of(&page_id).await?;
+        let activation = page.activate().await.map_err(fail)?;
+        Ok(ok(serde_json::to_string_pretty(&serde_json::json!({
+            "page": page_id,
+            "activated": activation.activated,
+            "visibility": activation.visibility,
+            "window_focused": activation.window_focused,
+            "attempts": activation.attempts,
+        }))
+        .unwrap_or_else(|_| "{}".into())))
+    }
+
     /// Click an element by its snapshot ref, then report what changed.
     #[tool(description = "Click an element by ref (synthesized mouse click); returns settle-diff")]
     async fn browser_click(
@@ -878,6 +921,31 @@ impl BrowserServer {
         page.click(backend).await.map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
         Ok(ok(format!("clicked on {}\n\n{}", a.page, diff)))
+    }
+
+    /// Send a native CDP mouse-wheel event at viewport coordinates.
+    #[tool(
+        description = "Scroll with a real CDP mouseWheel event at viewport coordinates; returns settle-diff"
+    )]
+    async fn browser_wheel(
+        &self,
+        Parameters(a): Parameters<WheelArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_wheel_input(a.delta_y, a.x, a.y).map_err(fail)?;
+
+        let page_id = self.canonical_page_id(&a.page).await?;
+        let page = self.page_of(&page_id).await?;
+        page.wheel(a.delta_y, a.x, a.y).await.map_err(fail)?;
+        let diff = self.settle_diff(&page_id, &page).await?;
+        Ok(ok(serde_json::to_string_pretty(&serde_json::json!({
+            "page": page_id,
+            "dispatched": true,
+            "delta_y": a.delta_y,
+            "x": a.x,
+            "y": a.y,
+            "diff": diff,
+        }))
+        .unwrap_or_else(|_| "{}".into())))
     }
 
     /// Type text into an element by ref (optionally clearing it first).
@@ -2051,8 +2119,8 @@ Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_STEALT
 mod tests {
     use super::{
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner, parse_cli_from,
-        parse_connect_port, release_owner_claim, webauthn_options_match_automatic_defaults, State,
-        REQUEST_OWNER,
+        parse_connect_port, release_owner_claim, validate_wheel_input,
+        webauthn_options_match_automatic_defaults, BrowserServer, State, REQUEST_OWNER,
     };
 
     #[test]
@@ -2068,6 +2136,30 @@ mod tests {
             .scope(Some("한국어-owner".to_string()), async {
                 assert!(enforce_scoped_owner("한국어-owner", "release").is_ok());
                 assert!(enforce_scoped_owner("other-owner", "release").is_err());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn scoped_page_resolution_blocks_other_owners_for_activation_and_wheel() {
+        let mut state = State::default();
+        state.owners.insert("owner-a".into(), "p1".into());
+        state.owners.insert("owner-b".into(), "p2".into());
+        state.page_owners.insert("p1".into(), "owner-a".into());
+        state.page_owners.insert("p2".into(), "owner-b".into());
+
+        REQUEST_OWNER
+            .scope(Some("owner-a".to_string()), async {
+                assert_eq!(
+                    BrowserServer::resolve_page_id(&state, "owner-a"),
+                    Some("p1".into())
+                );
+                assert_eq!(
+                    BrowserServer::resolve_page_id(&state, "p1"),
+                    Some("p1".into())
+                );
+                assert_eq!(BrowserServer::resolve_page_id(&state, "owner-b"), None);
+                assert_eq!(BrowserServer::resolve_page_id(&state, "p2"), None);
             })
             .await;
     }
@@ -2138,6 +2230,27 @@ mod tests {
         assert!(!webauthn_options_match_automatic_defaults(
             "internal", true, false
         ));
+    }
+
+    #[test]
+    fn foreground_and_wheel_tools_are_publicly_registered() {
+        let tools = BrowserServer::new().tool_router.list_all();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"browser_activate_page"));
+        assert!(names.contains(&"browser_wheel"));
+    }
+
+    #[test]
+    fn wheel_input_rejects_invalid_coordinates_and_non_finite_numbers() {
+        assert!(validate_wheel_input(700.0, 650.0, 500.0).is_ok());
+        assert!(validate_wheel_input(-700.0, 650.0, 500.0).is_ok());
+        assert!(validate_wheel_input(700.0, -1.0, 500.0).is_err());
+        assert!(validate_wheel_input(700.0, 650.0, -1.0).is_err());
+        assert!(validate_wheel_input(f64::INFINITY, 650.0, 500.0).is_err());
+        assert!(validate_wheel_input(700.0, f64::NAN, 500.0).is_err());
     }
 }
 
