@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-AB_VERSION=v0.1.14 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
+AB_VERSION=v0.1.15 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -88,6 +88,11 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 ```
 
 Set `AB_CHROME` if Chrome is not in a standard location.
+
+## What's new in v0.1.15
+
+- Managed secret-broker output limits now reach the Rust handlers, preserving redaction-before-truncation for snapshots, API responses, visible text, and HTML.
+- Text truncation is UTF-8 boundary safe.
 
 ## What's new in v0.1.14
 

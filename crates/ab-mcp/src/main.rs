@@ -150,6 +150,19 @@ fn snapshot_diff(old: &str, new: &str) -> String {
     }
 }
 
+fn truncate_text(mut value: String, limit: usize) -> String {
+    if value.len() <= limit {
+        return value;
+    }
+    let mut boundary = limit.min(value.len());
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value.push_str("\n… (truncated)");
+    value
+}
+
 #[derive(Default)]
 struct State {
     browser: Option<Browser>,
@@ -207,6 +220,16 @@ struct FindArgs {
 struct PageArg {
     /// Page id (e.g. "p1") or owner alias from browser_claim_page.
     page: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BoundedPageArg {
+    /// Page id (e.g. "p1") or owner alias from browser_claim_page.
+    page: String,
+    /// Maximum output characters. Managed hosts may raise this so secrets are
+    /// redacted before the caller-visible limit is applied.
+    #[serde(default, rename = "maxLength")]
+    max_length: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -463,6 +486,10 @@ struct ApiRequestArgs {
     /// Request body (for POST/PUT).
     #[serde(default)]
     data: Option<String>,
+    /// Maximum response-body characters. Managed hosts may raise this so
+    /// secrets are redacted before the caller-visible limit is applied.
+    #[serde(default, rename = "maxBytes")]
+    max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -931,13 +958,17 @@ impl BrowserServer {
     #[tool(description = "Accessibility-tree snapshot of a page, with [ref] handles")]
     async fn browser_snapshot(
         &self,
-        Parameters(a): Parameters<PageArg>,
+        Parameters(a): Parameters<BoundedPageArg>,
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
         let snap = page.snapshot().await.map_err(fail)?;
         self.store_snapshot(&a.page, snap.refs.clone(), snap.text.clone())
             .await;
-        Ok(ok(format!("page {}\n\n{}", a.page, snap.text)))
+        let output = format!("page {}\n\n{}", a.page, snap.text);
+        Ok(ok(match a.max_length {
+            Some(limit) => truncate_text(output, limit),
+            None => output,
+        }))
     }
 
     /// Activate a page target and verify foreground/visibility state.
@@ -1194,10 +1225,14 @@ impl BrowserServer {
             )
             .await
             .map_err(fail)?;
-        Ok(ok(v
+        let output = v
             .as_str()
             .map(str::to_string)
-            .unwrap_or_else(|| v.to_string())))
+            .unwrap_or_else(|| v.to_string());
+        Ok(ok(match a.max_bytes {
+            Some(limit) => truncate_text(output, limit),
+            None => output,
+        }))
     }
 
     /// Set files on a file input (by ref or selector).
@@ -1633,32 +1668,22 @@ impl BrowserServer {
     #[tool(description = "Get the page's full HTML (document.documentElement.outerHTML)")]
     async fn browser_get_visible_html(
         &self,
-        Parameters(a): Parameters<PageArg>,
+        Parameters(a): Parameters<BoundedPageArg>,
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
-        let mut html = page.html().await.map_err(fail)?;
-        const MAX: usize = 200_000;
-        if html.len() > MAX {
-            html.truncate(MAX);
-            html.push_str("\n… (truncated)");
-        }
-        Ok(ok(html))
+        let html = page.html().await.map_err(fail)?;
+        Ok(ok(truncate_text(html, a.max_length.unwrap_or(200_000))))
     }
 
     /// Extract the page's visible text (innerText).
     #[tool(description = "Get the page's visible text (innerText)")]
     async fn browser_get_visible_text(
         &self,
-        Parameters(a): Parameters<PageArg>,
+        Parameters(a): Parameters<BoundedPageArg>,
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
-        let mut txt = page.text().await.map_err(fail)?;
-        const MAX: usize = 100_000;
-        if txt.len() > MAX {
-            txt.truncate(MAX);
-            txt.push_str("\n… (truncated)");
-        }
-        Ok(ok(txt))
+        let text = page.text().await.map_err(fail)?;
+        Ok(ok(truncate_text(text, a.max_length.unwrap_or(100_000))))
     }
 
     /// Search a page's visible text for a query (substring or regex).
@@ -2233,8 +2258,8 @@ mod tests {
     use super::{
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner,
         force_scoped_owner_argument, parse_allowed_tools, parse_cli_from, parse_connect_port,
-        release_owner_claim, validate_wheel_input, webauthn_options_match_automatic_defaults,
-        BrowserServer, State, REQUEST_OWNER,
+        release_owner_claim, truncate_text, validate_wheel_input,
+        webauthn_options_match_automatic_defaults, BrowserServer, State, REQUEST_OWNER,
     };
     use rmcp::model::CallToolRequestParams;
 
@@ -2243,6 +2268,13 @@ mod tests {
         assert!(constant_time_secret_eq("한국어-token", "한국어-token"));
         assert!(!constant_time_secret_eq("한국어-token", "other-token"));
         assert!(!constant_time_secret_eq("short", "longer"));
+    }
+
+    #[test]
+    fn text_truncation_respects_utf8_boundaries() {
+        assert_eq!(truncate_text("abcdef".into(), 3), "abc\n… (truncated)");
+        assert_eq!(truncate_text("한abcd".into(), 4), "한a\n… (truncated)");
+        assert_eq!(truncate_text("한글".into(), usize::MAX), "한글");
     }
 
     #[tokio::test]
