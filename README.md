@@ -56,6 +56,12 @@ curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/in
 browser-rs --help
 ```
 
+To pin this release instead of following `latest`:
+
+```bash
+AB_VERSION=v0.1.14 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
+```
+
 **2. Run** — use stdio for a client that launches the server:
 
 ```bash
@@ -82,6 +88,22 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 ```
 
 Set `AB_CHROME` if Chrome is not in a standard location.
+
+## What's new in v0.1.14
+
+- Managed HTTP mode authenticates each owner with an HMAC-derived capability
+  and binds both streamable HTTP and legacy SSE sessions to that owner.
+- `/owners` is root-capability only, while SSE message posts use a separate
+  random per-session token.
+- `AB_ALLOWED_TOOLS` applies the same fail-closed allowlist to tool discovery
+  and invocation.
+- An optional Unix-socket secret broker transforms tool input and redacts tool
+  output without exposing the host credential database to browser-rs or Chrome.
+- Server credentials are removed before Chrome starts, and graceful shutdown
+  now closes active transports and process-owned Chrome instances.
+
+Standalone stdio and unauthenticated loopback HTTP keep their existing defaults
+unless managed mode or a capability is explicitly configured.
 
 ## Connect an MCP client
 
