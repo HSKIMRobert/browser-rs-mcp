@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-AB_VERSION=v0.1.15 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
+AB_VERSION=v0.1.16 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -89,26 +89,32 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 
 Set `AB_CHROME` if Chrome is not in a standard location.
 
-## What's new in v0.1.15
+<details>
+<summary><strong>What's new (v0.1.14 – v0.1.16)</strong></summary>
 
-- Managed secret-broker output limits now reach the Rust handlers, preserving redaction-before-truncation for snapshots, API responses, visible text, and HTML.
-- Text truncation is UTF-8 boundary safe.
+**v0.1.14 — managed hosting security.** browser-rs can now run behind a
+trusted host (like an agent platform) that spins up one server for many
+tenants. New in this mode: per-owner HMAC capability tokens, a fail-closed
+`AB_ALLOWED_TOOLS` allowlist, an optional secret broker that keeps the
+credential database and lookup logic out of browser-rs, and graceful shutdown
+that cleans up Chrome. See [Managed mode](#managed-mode-secure-multi-tenant-hosting)
+below.
 
-## What's new in v0.1.14
+**v0.1.15 — safer output limits.** Output truncation (snapshots, HTML, visible
+text, API responses) now respects UTF-8 character boundaries instead of
+cutting mid-character, and managed hosts can raise the internal limit so the
+secret broker redacts *before* truncation, not after.
 
-- Managed HTTP mode authenticates each owner with an HMAC-derived capability
-  and binds both streamable HTTP and legacy SSE sessions to that owner.
-- `/owners` is root-capability only, while SSE message posts use a separate
-  random per-session token.
-- `AB_ALLOWED_TOOLS` applies the same fail-closed allowlist to tool discovery
-  and invocation.
-- An optional Unix-socket secret broker transforms tool input and redacts tool
-  output without exposing the host credential database to browser-rs or Chrome.
-- Server credentials are removed before Chrome starts, and graceful shutdown
-  now closes active transports and process-owned Chrome instances.
+**v0.1.16 — output-limit hardening.** A caller-supplied `maxLength`/`maxBytes`
+(e.g. `usize::MAX`) is now clamped to an absolute ceiling (`AB_MAX_OUTPUT_LIMIT`,
+default 5 MB — well above the 100k/200k tool defaults) so one managed tenant
+can no longer force an oversized response and degrade the shared process for
+everyone else.
 
-Standalone stdio and unauthenticated loopback HTTP keep their existing defaults
-unless managed mode or a capability is explicitly configured.
+Standalone stdio and unauthenticated loopback HTTP — the default for most
+users — are unaffected and keep their existing behavior.
+
+</details>
 
 ## Connect an MCP client
 
@@ -151,6 +157,58 @@ Connections without an owner are administrative and can access all tabs, so do
 not expose an ownerless HTTP endpoint publicly. Owner setup, per-owner cleanup,
 and capability-header details are in **[INSTALL.md](INSTALL.md)**.
 
+## Managed mode (secure multi-tenant hosting)
+
+Plain multi-agent tabs (above) trust every caller. **Managed mode** is for a
+host that runs one browser-rs process for many untrusted tenants — it adds
+per-owner authentication and keeps the credential *database* out of
+browser-rs. (Secret *values* still pass through browser-rs' memory on their
+way to Chrome — the broker keeps the lookup/storage logic and long-term
+credentials out, not the in-flight value itself.)
+
+```mermaid
+sequenceDiagram
+    participant T as Tenant A (owner=A)
+    participant H as Host platform
+    participant B as browser-rs
+    participant S as Secret broker
+    participant C as Chrome
+
+    H->>H: derive capability = HMAC(root, "A")
+    H-->>T: hand tenant its capability for owner "A"
+    T->>B: request + X-Browser-Capability + X-Browser-Owner: A
+    B->>B: verify capability, pin session to owner "A"
+    B->>S: transform tool input (e.g. inject a saved password)
+    S-->>B: real value, never logged to the client
+    B->>C: drive the browser (CDP)
+    C-->>B: page output (may contain secrets)
+    B->>S: redact output
+    S-->>B: safe-to-return text
+    B-->>T: result (owner A's tabs only)
+```
+
+- **Capability tokens** — the host holds one root secret and hands each tenant
+  an `HMAC-SHA256(root, owner)` token, so a leaked tenant token can't be used
+  to impersonate another owner or reach `/owners` (root-only).
+- **Secret broker** — a Unix-socket side-process the host controls. browser-rs
+  sends tool *input* through it before acting (e.g. to fill in a real
+  credential the tenant never sees) and tool *output* through it again before
+  replying (to redact secrets from page text). browser-rs itself never touches
+  the credential database, and any broker error or timeout fails closed. Tools
+  that return page content (`browser_snapshot`, `browser_get_visible_html`,
+  `browser_get_visible_text`, `browser_api_request`) accept an optional
+  `maxLength`/`maxBytes` so the host can raise the internal limit and let the
+  broker redact *before* the caller-visible truncation is applied.
+- **Tool allowlist** — `AB_ALLOWED_TOOLS` restricts which `browser_*` tools a
+  managed tenant can even see or call.
+
+**Required** to turn this on: `AB_MANAGED=1` plus both `AB_HTTP_CAPABILITY` and
+`AB_SPAWN_NONCE` (the server refuses to start managed without all three).
+**Optional**: `AB_SECRET_BROKER_SOCKET` and `AB_SECRET_BROKER_TOKEN` together,
+if you want the redaction broker (see [CLI and environment](#cli-and-environment)
+for full per-variable semantics). Standalone/self-hosted users can ignore this
+whole section — it only activates when a host explicitly configures it.
+
 ## Tools
 
 MCP exposes 64 `browser_*` tools:
@@ -191,25 +249,34 @@ environment variables are `AB_HTTP`, `AB_PROFILE`, `AB_HEADLESS`, `AB_CONNECT`,
 `AB_STEALTH`, and `AB_CHROME`. `AB_HTTP_CAPABILITY` protects HTTP/SSE requests
 with `X-Browser-Capability` and is required for non-loopback binds.
 
-Managed hosts can set `AB_MANAGED=1`, `AB_HTTP_CAPABILITY=<random-root>`, and
-`AB_SPAWN_NONCE=<random-nonce>`. In this mode `/health` reports the spawn nonce,
-`/owners` requires the root capability, and each `/sse` or `/mcp` connection
-requires `X-Browser-Capability = HMAC-SHA256(root, owner)`. Streamable HTTP
-sessions are pinned to their authenticated owner, while legacy SSE message
-posts use a random per-session token. The root capability and spawn nonce are
-removed from the environment before Chrome is launched.
+Managed hosts (see [Managed mode](#managed-mode-secure-multi-tenant-hosting)
+above) can set:
 
-`AB_ALLOWED_TOOLS` optionally limits the published and callable tool names to a
-comma-separated allowlist. It is intended for embedding hosts; an unset value
-keeps the complete standalone catalog.
+| Variable | Purpose |
+|---|---|
+| `AB_MANAGED=1` | Turns on per-owner capability auth for `/sse` and `/mcp` |
+| `AB_HTTP_CAPABILITY=<random-root>` | Root secret the host derives per-owner tokens from |
+| `AB_SPAWN_NONCE=<random-nonce>` | Reported on `/health` so the host can confirm which process instance is live |
+| `AB_ALLOWED_TOOLS=<a,b,c>` | Fail-closed allowlist of callable/visible `browser_*` tool names |
+| `AB_SECRET_BROKER_SOCKET`, `AB_SECRET_BROKER_TOKEN` | Unix-socket broker that injects secrets into tool input and redacts them from tool output |
+| `AB_MAX_OUTPUT_LIMIT=<bytes>` | Absolute ceiling any caller's `maxLength`/`maxBytes` is clamped to (default 5,000,000 — already far above the 100k/200k tool defaults, so it only matters if a host needs a different bound) |
 
-Managed hosts may also set both `AB_SECRET_BROKER_SOCKET` and
-`AB_SECRET_BROKER_TOKEN`. Browser.rs sends each tool input through the broker
-before dispatch and sends the result through it again before returning data to
-the client. The broker owns secret lookup and retained redaction forms; the
-Rust process never reads the host's credential database. Broker timeouts,
-malformed replies, and redaction failures fail closed. Broker credentials are
-removed from the environment before Chrome is launched.
+Secret-bearing variables (`AB_HTTP_CAPABILITY`, `AB_SPAWN_NONCE`,
+`AB_SECRET_BROKER_TOKEN`) are removed from the process environment before
+Chrome launches, so neither Chrome nor its renderers ever see them.
+`AB_MANAGED` and `AB_ALLOWED_TOOLS` are not secrets and are left in place.
+
+These variables are not independent switches — mixing them incorrectly fails
+startup or silently changes standalone behavior:
+
+- `AB_MANAGED=1` **requires** both `AB_HTTP_CAPABILITY` and `AB_SPAWN_NONCE` to
+  also be set, or the server refuses to start.
+- `AB_HTTP_CAPABILITY` set **without** `AB_MANAGED=1` still enables simple
+  capability-header auth on standalone HTTP — it is not managed-mode-only.
+- `AB_SECRET_BROKER_SOCKET` and `AB_SECRET_BROKER_TOKEN` must be set **together**;
+  supplying only one fails startup.
+- `AB_ALLOWED_TOOLS` restricts tool discovery/invocation in **every** mode,
+  including plain stdio — it is not limited to managed hosts.
 
 For `--connect`, start Chrome with an explicit remote debugging port, then pass
 that port or its URL:

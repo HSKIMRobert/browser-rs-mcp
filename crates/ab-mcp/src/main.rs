@@ -150,7 +150,39 @@ fn snapshot_diff(old: &str, new: &str) -> String {
     }
 }
 
+/// Default ceiling on caller-supplied `maxLength`/`maxBytes` when
+/// `AB_MAX_OUTPUT_LIMIT` is not set. Comfortably above the tool defaults
+/// (100_000 / 200_000 chars) so it never interferes with normal use; it only
+/// stops a caller from requesting something like `usize::MAX`.
+const DEFAULT_MAX_OUTPUT_LIMIT: usize = 5_000_000; // 5 MB
+
+/// Absolute ceiling on caller-supplied `maxLength`/`maxBytes`, regardless of
+/// what a tenant requests. Without this, a managed-mode caller could ask for
+/// `usize::MAX` and force browser-rs (and the secret broker round-trip) to
+/// hold and ship an unbounded amount of page content, degrading the shared
+/// process for every other tenant. Hosts that need a different ceiling can
+/// set `AB_MAX_OUTPUT_LIMIT` (bytes) at startup.
+fn configured_max_output_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let configured = std::env::var("AB_MAX_OUTPUT_LIMIT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&value| value > 0);
+        std::env::remove_var("AB_MAX_OUTPUT_LIMIT");
+        configured.unwrap_or(DEFAULT_MAX_OUTPUT_LIMIT)
+    })
+}
+
+/// Clamp a caller-supplied output limit to the configured ceiling so no
+/// request can force an unbounded allocation/response, no matter what value
+/// is sent.
+fn clamp_output_limit(requested: usize) -> usize {
+    requested.min(configured_max_output_limit())
+}
+
 fn truncate_text(mut value: String, limit: usize) -> String {
+    let limit = clamp_output_limit(limit);
     if value.len() <= limit {
         return value;
     }
@@ -2259,7 +2291,8 @@ mod tests {
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner,
         force_scoped_owner_argument, parse_allowed_tools, parse_cli_from, parse_connect_port,
         release_owner_claim, truncate_text, validate_wheel_input,
-        webauthn_options_match_automatic_defaults, BrowserServer, State, REQUEST_OWNER,
+        webauthn_options_match_automatic_defaults, BrowserServer, State, DEFAULT_MAX_OUTPUT_LIMIT,
+        REQUEST_OWNER,
     };
     use rmcp::model::CallToolRequestParams;
 
@@ -2268,6 +2301,17 @@ mod tests {
         assert!(constant_time_secret_eq("한국어-token", "한국어-token"));
         assert!(!constant_time_secret_eq("한국어-token", "other-token"));
         assert!(!constant_time_secret_eq("short", "longer"));
+    }
+
+    #[test]
+    fn requested_output_limit_cannot_exceed_the_absolute_ceiling() {
+        // A caller requesting `usize::MAX` (or anything above the ceiling)
+        // must not force an unbounded allocation/response: the effective
+        // limit is capped, and oversized input is still truncated.
+        let oversized: String = "a".repeat(DEFAULT_MAX_OUTPUT_LIMIT + 10);
+        let truncated = truncate_text(oversized, usize::MAX);
+        assert!(truncated.len() <= DEFAULT_MAX_OUTPUT_LIMIT + "\n… (truncated)".len());
+        assert!(truncated.ends_with("\n… (truncated)"));
     }
 
     #[test]
