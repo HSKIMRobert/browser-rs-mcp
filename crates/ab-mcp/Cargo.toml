@@ -25,3 +25,7 @@ axum.workspace = true
 futures = "0.3"
 http = "1"
 url = "2"
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+tokio-util.workspace = true

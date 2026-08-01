@@ -105,6 +105,22 @@ other owners remain live. `browser_close` has the same owner-scoped behavior
 when called through an owner connection; only an ownerless administrative
 connection may close the complete browser.
 
+An embedding host may turn owner isolation into an authentication boundary with
+`AB_MANAGED=1`. The process receives a random root capability, but clients only
+receive `HMAC-SHA256(root, owner)`. Both HTTP transports bind their MCP session
+to that verified owner; `/owners` remains an administrative root-only endpoint.
+Standalone stdio and unauthenticated loopback HTTP remain available when managed
+mode is not enabled.
+
+Credential transformation remains host-owned. When
+`AB_SECRET_BROKER_SOCKET` and `AB_SECRET_BROKER_TOKEN` are configured,
+Browser.rs calls the Unix-socket broker before and after every tool invocation:
+`transform_input` returns the substituted input and a one-time lease, then
+`redact_output` consumes that lease. Redaction happens before caller-requested
+truncation. A configured broker is a security boundary, so connection,
+protocol, timeout, or redaction errors return a sanitized failure instead of
+the unprocessed tool result.
+
 ## Roadmap
 
 1. **ab-mcp MVP** — stdio server, tools: navigate / snapshot / evaluate /

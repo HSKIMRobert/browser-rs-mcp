@@ -164,6 +164,26 @@ environment variables are `AB_HTTP`, `AB_PROFILE`, `AB_HEADLESS`, `AB_CONNECT`,
 `AB_STEALTH`, and `AB_CHROME`. `AB_HTTP_CAPABILITY` protects HTTP/SSE requests
 with `X-Browser-Capability` and is required for non-loopback binds.
 
+Managed hosts can set `AB_MANAGED=1`, `AB_HTTP_CAPABILITY=<random-root>`, and
+`AB_SPAWN_NONCE=<random-nonce>`. In this mode `/health` reports the spawn nonce,
+`/owners` requires the root capability, and each `/sse` or `/mcp` connection
+requires `X-Browser-Capability = HMAC-SHA256(root, owner)`. Streamable HTTP
+sessions are pinned to their authenticated owner, while legacy SSE message
+posts use a random per-session token. The root capability and spawn nonce are
+removed from the environment before Chrome is launched.
+
+`AB_ALLOWED_TOOLS` optionally limits the published and callable tool names to a
+comma-separated allowlist. It is intended for embedding hosts; an unset value
+keeps the complete standalone catalog.
+
+Managed hosts may also set both `AB_SECRET_BROKER_SOCKET` and
+`AB_SECRET_BROKER_TOKEN`. Browser.rs sends each tool input through the broker
+before dispatch and sends the result through it again before returning data to
+the client. The broker owns secret lookup and retained redaction forms; the
+Rust process never reads the host's credential database. Broker timeouts,
+malformed replies, and redaction failures fail closed. Broker credentials are
+removed from the environment before Chrome is launched.
+
 For `--connect`, start Chrome with an explicit remote debugging port, then pass
 that port or its URL:
 

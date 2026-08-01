@@ -342,8 +342,8 @@ impl Browser {
 
     /// Terminate the browser process (only if we launched it; connect() no-op).
     pub async fn close(mut self) {
-        let _ = self.client.send("Browser.close", json!({})).await;
         if let Some(child) = self.child.as_mut() {
+            let _ = self.client.send("Browser.close", json!({})).await;
             let _ = child.kill().await;
         }
     }

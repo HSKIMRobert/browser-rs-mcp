@@ -5,8 +5,8 @@
 //!
 //! Core loop the tools encode: **snapshot -> act -> verify**.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 use ab_browser::{Browser, ConsoleLog, LaunchOptions, NetworkLog, Page};
 use rmcp::handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters};
@@ -20,6 +20,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::info;
+
+mod http_security;
+mod secret_broker;
 
 const INSTRUCTIONS: &str = r#"browser-rs — a real Chrome driven over CDP, no bundled agent.
 
@@ -38,6 +41,43 @@ tokio::task_local! {
 
 fn request_owner() -> Option<String> {
     REQUEST_OWNER.try_with(Clone::clone).ok().flatten()
+}
+
+fn configured_allowed_tools() -> Option<Arc<HashSet<String>>> {
+    static ALLOWED: OnceLock<Option<Arc<HashSet<String>>>> = OnceLock::new();
+    ALLOWED
+        .get_or_init(|| {
+            let configured = parse_allowed_tools(std::env::var("AB_ALLOWED_TOOLS").ok());
+            std::env::remove_var("AB_ALLOWED_TOOLS");
+            configured.map(Arc::new)
+        })
+        .clone()
+}
+
+fn parse_allowed_tools(value: Option<String>) -> Option<HashSet<String>> {
+    value.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn force_scoped_owner_argument(request: &mut CallToolRequestParams, owner: &str) {
+    if matches!(
+        request.name.as_ref(),
+        "browser_claim_page" | "browser_release_page"
+    ) {
+        request
+            .arguments
+            .get_or_insert_with(Default::default)
+            .insert(
+                "owner".to_string(),
+                serde_json::Value::String(owner.to_string()),
+            );
+    }
 }
 
 fn enforce_scoped_owner(requested_owner: &str, operation: &str) -> Result<(), McpError> {
@@ -127,6 +167,8 @@ struct BrowserServer {
     state: Arc<Mutex<State>>,
     tool_router: ToolRouter<Self>,
     default_owner: Option<String>,
+    allowed_tools: Option<Arc<HashSet<String>>>,
+    secret_broker: Option<secret_broker::SecretBroker>,
 }
 
 // ---- tool parameter schemas ----
@@ -510,24 +552,31 @@ fn validate_wheel_input(delta_y: f64, x: f64, y: f64) -> Result<(), &'static str
 }
 
 impl BrowserServer {
+    #[cfg(test)]
     fn new() -> Self {
-        Self::with_state(Arc::new(Mutex::new(State::default())))
+        Self::with_state_and_broker(Arc::new(Mutex::new(State::default())), None, None)
     }
 
-    /// Build a handler that shares an existing `State` (one Chrome + tabs) across
-    /// sessions. In HTTP mode every MCP session (each turn's `/sse` or `/mcp`
-    /// connection) is handed a clone of ONE process-wide state, so the browser
-    /// stays resident between turns instead of being relaunched per connection.
-    fn with_state(state: Arc<Mutex<State>>) -> Self {
-        Self::with_state_and_owner(state, None)
-    }
-
-    fn with_state_and_owner(state: Arc<Mutex<State>>, default_owner: Option<String>) -> Self {
+    fn with_state_and_broker(
+        state: Arc<Mutex<State>>,
+        default_owner: Option<String>,
+        secret_broker: Option<secret_broker::SecretBroker>,
+    ) -> Self {
         Self {
             state,
             tool_router: Self::tool_router(),
             default_owner,
+            allowed_tools: configured_allowed_tools(),
+            secret_broker,
         }
+    }
+
+    fn tool_is_allowed(&self, name: &str) -> bool {
+        name.starts_with("browser_")
+            && self
+                .allowed_tools
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(name))
     }
 
     fn resolve_page_id(st: &State, id_or_owner: &str) -> Option<String> {
@@ -2010,34 +2059,86 @@ impl BrowserServer {
 impl rmcp::ServerHandler for BrowserServer {
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        if !self.tool_is_allowed(request.name.as_ref()) {
+            return Err(McpError::invalid_request(
+                format!("browser tool '{}' is not allowed", request.name),
+                None,
+            ));
+        }
         let owner = context
             .extensions
             .get::<http::request::Parts>()
             .and_then(|parts| {
-                parts
-                    .headers
-                    .get("x-browser-owner")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_string)
-                    .or_else(|| {
-                        url::form_urlencoded::parse(parts.uri.query()?.as_bytes())
+                http_security::canonical_owner(
+                    parts
+                        .headers
+                        .get("x-browser-owner")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                    parts.uri.query().and_then(|query| {
+                        url::form_urlencoded::parse(query.as_bytes())
                             .find(|(key, _)| key == "owner")
                             .map(|(_, value)| value.into_owned())
-                    })
+                    }),
+                )
             })
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
             .or_else(|| self.default_owner.clone());
-        REQUEST_OWNER
+        if let Some(owner) = owner.as_ref() {
+            force_scoped_owner_argument(&mut request, owner);
+        }
+        let broker_context = if let Some(broker) = self.secret_broker.as_ref() {
+            let input = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
+            let transformed = broker
+                .transform_input(request.name.as_ref(), input)
+                .await
+                .map_err(|_| {
+                    McpError::internal_error("browser input was blocked by secure broker", None)
+                })?;
+            request.arguments = match transformed.value {
+                serde_json::Value::Object(arguments) => Some(arguments),
+                _ => {
+                    return Err(McpError::internal_error(
+                        "secure broker returned invalid browser arguments",
+                        None,
+                    ))
+                }
+            };
+            if let Some(owner) = owner.as_ref() {
+                force_scoped_owner_argument(&mut request, owner);
+            }
+            Some((broker.clone(), transformed.lease, transformed.boundary))
+        } else {
+            None
+        };
+        let result = REQUEST_OWNER
             .scope(owner, async {
                 self.tool_router
                     .call(ToolCallContext::new(self, request, context))
                     .await
             })
+            .await;
+        let Some((broker, lease, boundary)) = broker_context else {
+            return result;
+        };
+        let unredacted = match result {
+            Ok(value) => value,
+            Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
+        };
+        let value = serde_json::to_value(unredacted).map_err(|_| {
+            McpError::internal_error("browser output was blocked before secure redaction", None)
+        })?;
+        let secured = broker
+            .redact_output(lease, boundary, value)
             .await
+            .map_err(|_| {
+                McpError::internal_error("browser output was blocked by secure redaction", None)
+            })?;
+        serde_json::from_value(secured).map_err(|_| {
+            McpError::internal_error("secure broker returned invalid browser output", None)
+        })
     }
 
     async fn list_tools(
@@ -2046,7 +2147,12 @@ impl rmcp::ServerHandler for BrowserServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult {
-            tools: self.tool_router.list_all(),
+            tools: self
+                .tool_router
+                .list_all()
+                .into_iter()
+                .filter(|tool| self.tool_is_allowed(tool.name.as_ref()))
+                .collect(),
             ..Default::default()
         })
     }
@@ -2091,7 +2197,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("browser-rs MCP server starting on stdio");
-    let service = BrowserServer::new().serve(rmcp::transport::stdio()).await?;
+    let secret_broker = secret_broker::SecretBroker::from_env()?;
+    let service = BrowserServer::with_state_and_broker(
+        Arc::new(Mutex::new(State::default())),
+        None,
+        secret_broker,
+    )
+    .serve(rmcp::transport::stdio())
+    .await?;
     service.waiting().await?;
     Ok(())
 }
@@ -2118,10 +2231,12 @@ Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_STEALT
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner, parse_cli_from,
-        parse_connect_port, release_owner_claim, validate_wheel_input,
-        webauthn_options_match_automatic_defaults, BrowserServer, State, REQUEST_OWNER,
+        bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner,
+        force_scoped_owner_argument, parse_allowed_tools, parse_cli_from, parse_connect_port,
+        release_owner_claim, validate_wheel_input, webauthn_options_match_automatic_defaults,
+        BrowserServer, State, REQUEST_OWNER,
     };
+    use rmcp::model::CallToolRequestParams;
 
     #[test]
     fn capability_comparison_requires_an_exact_match() {
@@ -2179,6 +2294,37 @@ mod tests {
             state.page_owners.get("p1").map(String::as_str),
             Some("owner-a")
         );
+    }
+
+    #[test]
+    fn configured_empty_allowlist_denies_every_tool() {
+        assert!(parse_allowed_tools(None).is_none());
+        assert_eq!(
+            parse_allowed_tools(Some(" , ".into())),
+            Some(Default::default())
+        );
+        assert_eq!(
+            parse_allowed_tools(Some("browser_pages, browser_pages, browser_close".into()))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn scoped_claim_and_release_arguments_cannot_select_another_owner() {
+        for tool in ["browser_claim_page", "browser_release_page"] {
+            let mut request =
+                CallToolRequestParams::new(tool).with_arguments(serde_json::Map::from_iter([(
+                    "owner".into(),
+                    serde_json::Value::String("attacker-selected".into()),
+                )]));
+            force_scoped_owner_argument(&mut request, "authenticated-owner");
+            assert_eq!(
+                request.arguments.unwrap().get("owner"),
+                Some(&serde_json::Value::String("authenticated-owner".into()))
+            );
+        }
     }
 
     #[test]
@@ -2355,8 +2501,13 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> anyhow::Result<Cli>
 // JSON-RPC to that endpoint. We bridge each session to rmcp's service by wiring
 // a `(Sink, Stream)` pair (futures unbounded channels) into `serve()`.
 
-type SseSessions =
-    Arc<Mutex<HashMap<String, futures::channel::mpsc::UnboundedSender<ClientJsonRpcMessage>>>>;
+#[derive(Clone)]
+struct SseSession {
+    sender: futures::channel::mpsc::UnboundedSender<ClientJsonRpcMessage>,
+    message_token: String,
+}
+
+type SseSessions = Arc<Mutex<HashMap<String, SseSession>>>;
 
 #[derive(Clone)]
 struct SseState {
@@ -2364,22 +2515,58 @@ struct SseState {
     /// Process-wide browser state shared across all SSE sessions, so Chrome
     /// stays resident between turns (each turn opens a fresh SSE connection).
     browser: Arc<Mutex<State>>,
+    security: http_security::HttpSecurity,
+    secret_broker: Option<secret_broker::SecretBroker>,
 }
 
 fn new_session_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    format!("{nanos:016x}{n:08x}")
+    random_token()
+}
+
+fn random_token() -> String {
+    use rand::{rngs::OsRng, RngCore};
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+struct SseSessionStream {
+    inner: std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
+                + Send,
+        >,
+    >,
+    sessions: SseSessions,
+    session_id: String,
+}
+
+impl futures::Stream for SseSessionStream {
+    type Item = Result<axum::response::sse::Event, std::convert::Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(context)
+    }
+}
+
+impl Drop for SseSessionStream {
+    fn drop(&mut self) {
+        let sessions = self.sessions.clone();
+        let session_id = self.session_id.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                sessions.lock().await.remove(&session_id);
+            });
+        }
+    }
 }
 
 async fn sse_get(
     axum::extract::State(state): axum::extract::State<SseState>,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: axum::http::HeaderMap,
 ) -> axum::response::sse::Sse<
     impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
@@ -2388,30 +2575,38 @@ async fn sse_get(
     use futures::StreamExt;
 
     let session_id = new_session_id();
-    let owner = headers
-        .get("x-browser-owner")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| params.get("owner").cloned())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let message_token = random_token();
+    let query_owner = uri.query().and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "owner")
+            .map(|(_, value)| value.into_owned())
+    });
+    let owner = http_security::canonical_owner(
+        headers
+            .get("x-browser-owner")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+        query_owner,
+    );
     // server → client (TX): rmcp writes here, the SSE stream drains it.
     let (to_client_tx, to_client_rx) = futures::channel::mpsc::unbounded::<ServerJsonRpcMessage>();
     // client → server (RX): POST handler pushes here, rmcp reads it.
     let (from_client_tx, from_client_rx) =
         futures::channel::mpsc::unbounded::<ClientJsonRpcMessage>();
 
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(session_id.clone(), from_client_tx);
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        SseSession {
+            sender: from_client_tx,
+            message_token: message_token.clone(),
+        },
+    );
 
     let sessions = state.sessions.clone();
     let shared = state.browser.clone();
     let sid = session_id.clone();
     tokio::spawn(async move {
-        match BrowserServer::with_state_and_owner(shared, owner)
+        match BrowserServer::with_state_and_broker(shared, owner, state.secret_broker.clone())
             .serve((to_client_tx, from_client_rx))
             .await
         {
@@ -2424,19 +2619,23 @@ async fn sse_get(
         tracing::info!("sse session {sid} closed");
     });
 
+    let endpoint_session_id = session_id.clone();
     let endpoint = futures::stream::once(async move {
-        Ok::<_, std::convert::Infallible>(
-            Event::default()
-                .event("endpoint")
-                .data(format!("/message?sessionId={session_id}")),
-        )
+        Ok::<_, std::convert::Infallible>(Event::default().event("endpoint").data(format!(
+            "/message?sessionId={endpoint_session_id}&token={message_token}"
+        )))
     });
     let messages = to_client_rx.map(|msg| {
         let data = serde_json::to_string(&msg).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(Event::default().event("message").data(data))
     });
 
-    Sse::new(endpoint.chain(messages)).keep_alive(KeepAlive::default())
+    let stream = SseSessionStream {
+        inner: Box::pin(endpoint.chain(messages)),
+        sessions: state.sessions,
+        session_id,
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn sse_post(
@@ -2448,6 +2647,16 @@ async fn sse_post(
     let Some(session_id) = params.get("sessionId") else {
         return StatusCode::BAD_REQUEST;
     };
+    let Some(message_token) = params.get("token") else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    let session = state.sessions.lock().await.get(session_id).cloned();
+    let Some(session) = session else {
+        return StatusCode::NOT_FOUND;
+    };
+    if !constant_time_secret_eq(message_token, &session.message_token) {
+        return StatusCode::UNAUTHORIZED;
+    }
     let msg: ClientJsonRpcMessage = match serde_json::from_str(&body) {
         Ok(m) => m,
         Err(e) => {
@@ -2455,16 +2664,17 @@ async fn sse_post(
             return StatusCode::BAD_REQUEST;
         }
     };
-    let tx = state.sessions.lock().await.get(session_id).cloned();
-    match tx {
-        Some(tx) => {
-            if tx.unbounded_send(msg).is_err() {
-                return StatusCode::GONE;
-            }
-            StatusCode::ACCEPTED
-        }
-        None => StatusCode::NOT_FOUND,
+    if session.sender.unbounded_send(msg).is_err() {
+        state.sessions.lock().await.remove(session_id);
+        return StatusCode::GONE;
     }
+    StatusCode::ACCEPTED
+}
+
+async fn health(
+    axum::extract::State(state): axum::extract::State<SseState>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(state.security.health())
 }
 
 async fn close_owner_pages(
@@ -2542,31 +2752,6 @@ fn bind_address_is_loopback(bind: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-async fn require_http_capability(
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-    expected: Arc<Option<String>>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let Some(expected) = expected.as_deref() else {
-        return next.run(request).await;
-    };
-    let authorized = request
-        .headers()
-        .get("x-browser-capability")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|provided| constant_time_secret_eq(provided, expected));
-    if authorized {
-        return next.run(request).await;
-    }
-    (
-        axum::http::StatusCode::UNAUTHORIZED,
-        axum::Json(serde_json::json!({ "ok": false, "error": "invalid browser capability" })),
-    )
-        .into_response()
-}
-
 async fn serve_http(addr: &str) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -2584,50 +2769,96 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
     // the SSE state for the whole process lifetime, so the browser is never
     // dropped between sessions — only when the server process exits.
     let shared_state: Arc<Mutex<State>> = Arc::new(Mutex::new(State::default()));
+    let secret_broker = secret_broker::SecretBroker::from_env()?;
 
     let mcp_state = shared_state.clone();
+    let mcp_secret_broker = secret_broker.clone();
+    let streamable_config = StreamableHttpServerConfig::default();
+    let cancellation_token = streamable_config.cancellation_token.clone();
     let service: StreamableHttpService<BrowserServer, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(BrowserServer::with_state(mcp_state.clone())),
+            move || {
+                Ok(BrowserServer::with_state_and_broker(
+                    mcp_state.clone(),
+                    None,
+                    mcp_secret_broker.clone(),
+                ))
+            },
             Default::default(),
-            StreamableHttpServerConfig::default(),
+            streamable_config,
         );
 
+    let security = http_security::HttpSecurity::from_env(bind_address_is_loopback(&bind))?;
     let sse_state = SseState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         browser: shared_state,
+        security: security.clone(),
+        secret_broker: secret_broker.clone(),
     };
 
-    // Optional for standalone compatibility; hosts such as Negotium set a
-    // fresh process-local token so the loopback backend cannot be bypassed by
-    // another local process that discovers its random port.
-    let configured_http_capability = std::env::var("AB_HTTP_CAPABILITY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    // Do not leak the server credential into Chrome and its renderer children.
-    std::env::remove_var("AB_HTTP_CAPABILITY");
-    let is_loopback = bind_address_is_loopback(&bind);
-    if configured_http_capability.is_none() && !is_loopback {
-        anyhow::bail!("AB_HTTP_CAPABILITY is required when binding outside loopback");
-    }
-    let http_capability = Arc::new(configured_http_capability);
-    let auth_capability = http_capability.clone();
+    let auth_security = security.clone();
     let auth_layer = axum::middleware::from_fn(move |request, next| {
-        let expected = auth_capability.clone();
-        async move { require_http_capability(request, next, expected).await }
+        let security = auth_security.clone();
+        async move { http_security::authorize_http(security, request, next).await }
     });
 
     let router = axum::Router::new()
+        .route("/health", axum::routing::get(health))
         .route("/sse", axum::routing::get(sse_get))
         .route("/message", axum::routing::post(sse_post))
         .route("/owners", axum::routing::delete(close_owner_pages))
         .nest_service("/mcp", service)
-        .with_state(sse_state)
+        .with_state(sse_state.clone())
         .layer(auth_layer);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!("browser-rs MCP server on http://{bind}/mcp (streamable HTTP) + http://{bind}/sse (legacy SSE)");
-    axum::serve(listener, router).await?;
+    let shutdown_sessions = sse_state.sessions.clone();
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal(shutdown_sessions, cancellation_token))
+        .await?;
+
+    let browser = {
+        let mut state = sse_state.browser.lock().await;
+        state.pages.clear();
+        state.page_owners.clear();
+        state.owners.clear();
+        state.browser.take()
+    };
+    if let Some(browser) = browser {
+        browser.close().await;
+    }
     Ok(())
+}
+
+async fn shutdown_signal(
+    sessions: SseSessions,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) {
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!("failed to install SIGTERM handler: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                tracing::warn!("failed to listen for shutdown signal: {error}");
+            }
+        }
+        _ = terminate => {}
+    }
+    cancellation_token.cancel();
+    sessions.lock().await.clear();
 }
