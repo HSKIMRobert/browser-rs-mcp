@@ -47,6 +47,18 @@ fn is_noise(role: &str) -> bool {
     )
 }
 
+/// Iframe roles. These are surfaced even with no accessible name and no
+/// children, because a same-process (same-origin) iframe's content is
+/// already flattened into this same tree, while a cross-process
+/// (cross-origin) iframe's content is invisible to `Accessibility.getFullAXTree`
+/// entirely (separate renderer, separate CDP target) — without this line the
+/// agent would have no signal that an iframe exists at all. Use
+/// `browser_iframe_read` / `browser_iframe_click` / `browser_iframe_fill` to
+/// reach inside it.
+fn is_iframe(role: &str) -> bool {
+    matches!(role, "Iframe" | "iframe" | "IframePresentational")
+}
+
 /// AXValue is `{ "type": ..., "value": <string> }`; the payload is one level in.
 fn str_prop(node: &Value, key: &str) -> String {
     node.get(key)
@@ -111,14 +123,20 @@ fn walk(
         .unwrap_or("");
     let name = str_prop(node, "name");
 
-    // Decide whether this node earns a printed line.
-    let printable = !ignored && !is_noise(role) && (!name.is_empty() || is_interactive(role));
+    // Decide whether this node earns a printed line. Iframes are always
+    // printed (even nameless, childless ones) — see `is_iframe`.
+    let printable = !ignored
+        && !is_noise(role)
+        && (!name.is_empty() || is_interactive(role) || is_iframe(role));
 
     let child_depth = if printable {
         let indent = "  ".repeat(depth);
         let mut line = format!("{indent}{role}");
         if !name.is_empty() {
             line.push_str(&format!(" \"{}\"", truncate(&name, 120)));
+        }
+        if is_iframe(role) {
+            line.push_str(" [iframe: use browser_iframe_read/_click/_fill]");
         }
         if is_interactive(role) {
             *counter += 1;
@@ -151,5 +169,81 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max).collect();
         t.push('…');
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+    use serde_json::json;
+
+    #[test]
+    fn nameless_childless_iframe_is_still_printed() {
+        // A cross-origin OOPIF typically shows up as a nameless, childless
+        // "Iframe" node — regression check that it isn't silently dropped
+        // the way a nameless "generic"/"none" node would be.
+        let nodes = vec![
+            json!({
+                "nodeId": "1",
+                "role": {"value": "RootWebArea"},
+                "name": {"value": "page"},
+                "childIds": ["2"]
+            }),
+            json!({
+                "nodeId": "2",
+                "role": {"value": "Iframe"},
+                "name": {"value": ""}
+            }),
+        ];
+        let snap = render(&nodes);
+        assert!(
+            snap.text.contains("Iframe"),
+            "expected iframe node in snapshot text, got: {}",
+            snap.text
+        );
+        assert!(snap.text.contains("browser_iframe_read"));
+    }
+
+    #[test]
+    fn iframe_does_not_get_a_click_ref() {
+        // Iframes aren't in `is_interactive`, so they must not consume a
+        // [ref=eN] slot (that's reserved for click/type/etc. targets).
+        let nodes = vec![
+            json!({
+                "nodeId": "1",
+                "role": {"value": "RootWebArea"},
+                "name": {"value": "page"},
+                "childIds": ["2"]
+            }),
+            json!({
+                "nodeId": "2",
+                "role": {"value": "Iframe"},
+                "name": {"value": ""}
+            }),
+        ];
+        let snap = render(&nodes);
+        assert!(snap.refs.is_empty());
+        assert!(!snap.text.contains("[ref="));
+    }
+
+    #[test]
+    fn nameless_generic_node_is_still_pruned() {
+        // Regression guard: the iframe carve-out must not accidentally
+        // widen visibility for ordinary structural noise.
+        let nodes = vec![
+            json!({
+                "nodeId": "1",
+                "role": {"value": "RootWebArea"},
+                "name": {"value": "page"},
+                "childIds": ["2"]
+            }),
+            json!({
+                "nodeId": "2",
+                "role": {"value": "generic"},
+                "name": {"value": ""}
+            }),
+        ];
+        let snap = render(&nodes);
+        assert!(!snap.text.contains("generic"));
     }
 }

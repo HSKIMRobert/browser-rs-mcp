@@ -535,21 +535,72 @@ struct UploadArgs {
     paths: Vec<String>,
 }
 
+// Known limitations shared by all iframe_* tools' `frame_selector`:
+//
+// - `>>` is a naive string split, not a CSS-aware parser. A selector
+//   containing a *literal* `>>` substring inside a quoted attribute value
+//   (e.g. `iframe[src*="a>>b"]`) will be mis-split into two bogus hops.
+//   `>>` is vanishingly rare in real selectors/URLs, but this is a real gap,
+//   not a supported escape hatch — avoid `>>` inside selector strings.
+// - Cross-origin frames are located by the iframe element's `name`/`src`
+//   attributes, matched against the CDP frame tree. If a frame redirects or
+//   navigates itself after the initial load, its committed URL may no
+//   longer contain the original `src` and it becomes unresolvable — give
+//   such iframes a stable `name`/`id` instead of relying on `src` matching.
+// - If two iframes share the same `name` or a matching/overlapping `src`,
+//   resolution is intentionally rejected as "ambiguous" (an error) rather
+//   than silently guessing and risking action in the wrong origin —
+//   disambiguate with a more specific chain hop or a unique `name`/`id`.
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct IframeClickArgs {
     page: String,
-    /// CSS selector for the <iframe> element.
+    /// CSS selector for the <iframe> element. For nested iframes, chain
+    /// selectors with " >> " (e.g. "iframe.wrapper >> iframe.popup") to
+    /// descend through each level. Same-origin and cross-origin frames are
+    /// both supported and require no special handling from the caller. See
+    /// the `frame_selector` known-limitations note above this struct.
     frame_selector: String,
-    /// CSS selector for the element inside the iframe.
+    /// CSS selector for the element inside the innermost iframe.
     selector: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct IframeFillArgs {
     page: String,
+    /// CSS selector for the <iframe> element, or a " >> "-separated chain
+    /// for nested iframes. Same-origin and cross-origin frames are both
+    /// supported and require no special handling from the caller. See the
+    /// `frame_selector` known-limitations note above this struct.
     frame_selector: String,
+    /// CSS selector for the input inside the innermost iframe.
     selector: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct IframeReadArgs {
+    page: String,
+    /// CSS selector for the <iframe> element, or a " >> "-separated chain
+    /// for nested iframes. Same-origin and cross-origin frames are both
+    /// supported and require no special handling from the caller. See the
+    /// `frame_selector` known-limitations note above this struct.
+    frame_selector: String,
+    /// CSS selector for the element to read inside the innermost iframe.
+    /// Defaults to "html" (`document.querySelector("html")`) if omitted,
+    /// which reads the whole frame document — but only for HTML documents;
+    /// an XML/SVG-served frame has no <html> element, so pass an explicit
+    /// selector (or ":root") for those.
+    #[serde(default)]
+    selector: Option<String>,
+    /// "html" for outerHTML, "text" for rendered innerText. Defaults to
+    /// "text".
+    #[serde(default)]
+    mode: Option<String>,
+    /// Maximum output characters. Managed hosts may raise this so secrets
+    /// are redacted before the caller-visible limit is applied.
+    #[serde(default, rename = "maxLength")]
+    max_length: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1808,8 +1859,11 @@ impl BrowserServer {
         }))
     }
 
-    /// Click an element inside a same-origin iframe.
-    #[tool(description = "Click an element inside a same-origin iframe")]
+    /// Click an element inside an iframe (same-origin or cross-origin,
+    /// including nested chains via " >> ").
+    #[tool(
+        description = "Click an element inside an iframe. Handles same-origin and cross-origin frames automatically; chain nested iframes in frame_selector with ' >> '"
+    )]
     async fn browser_iframe_click(
         &self,
         Parameters(a): Parameters<IframeClickArgs>,
@@ -1822,8 +1876,11 @@ impl BrowserServer {
         Ok(ok(format!("iframe-clicked on {}\n\n{}", a.page, diff)))
     }
 
-    /// Fill an input inside a same-origin iframe.
-    #[tool(description = "Fill an input inside a same-origin iframe")]
+    /// Fill an input inside an iframe (same-origin or cross-origin,
+    /// including nested chains via " >> ").
+    #[tool(
+        description = "Fill an input inside an iframe. Handles same-origin and cross-origin frames automatically; chain nested iframes in frame_selector with ' >> '"
+    )]
     async fn browser_iframe_fill(
         &self,
         Parameters(a): Parameters<IframeFillArgs>,
@@ -1833,6 +1890,35 @@ impl BrowserServer {
             .await
             .map_err(fail)?;
         Ok(ok(format!("iframe-filled on {}", a.page)))
+    }
+
+    /// Read HTML or text from inside an iframe (same-origin or cross-origin,
+    /// including nested chains via " >> "). Use this to inspect content
+    /// hidden behind a cross-origin iframe that `browser_get_visible_html`
+    /// / `browser_get_visible_text` / `browser_snapshot` can't see into.
+    #[tool(
+        description = "Read outerHTML or innerText from inside an iframe. Handles same-origin and cross-origin frames automatically; chain nested iframes in frame_selector with ' >> '; selector defaults to the whole frame document"
+    )]
+    async fn browser_iframe_read(
+        &self,
+        Parameters(a): Parameters<IframeReadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        let mode = match a.mode.as_deref() {
+            Some("html") => ab_browser::ReadMode::Html,
+            Some("text") | None => ab_browser::ReadMode::Text,
+            Some(other) => {
+                return Err(fail(format!(
+                    "invalid mode `{other}` (expected \"html\" or \"text\")"
+                )))
+            }
+        };
+        let selector = a.selector.as_deref().unwrap_or("html");
+        let content = page
+            .iframe_read(&a.frame_selector, selector, mode)
+            .await
+            .map_err(fail)?;
+        Ok(ok(truncate_text(content, a.max_length.unwrap_or(100_000))))
     }
 
     /// Run arbitrary JavaScript with args (isolated world). Returns the result.

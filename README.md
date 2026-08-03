@@ -90,7 +90,26 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 – v0.1.16)</strong></summary>
+<summary><strong>What's new (v0.1.14 – v0.1.17)</strong></summary>
+
+**v0.1.17 — cross-origin iframe support.** `browser_iframe_click` and
+`browser_iframe_fill` now work on cross-origin iframes, not just same-origin
+ones — same-origin frames still resolve with a single JS round trip, but a
+cross-origin boundary automatically falls back to CDP
+(`Page.getFrameTree` + `Page.createIsolatedWorld`), which isn't subject to
+the Same-Origin Policy. Both tools also support nested iframes via a
+Playwright-style `" >> "` chain in `frame_selector` (e.g.
+`"iframe.wrapper >> iframe.popup"`). A new `browser_iframe_read` tool reads
+`outerHTML`/`innerText` from inside an iframe with the same resolution
+logic — use it where `browser_get_visible_html`/`_text`/`browser_snapshot`
+can't see past a cross-origin boundary. `browser_snapshot`'s accessibility
+tree also now always surfaces iframe nodes (even nameless ones) with a hint
+to use these tools, instead of silently pruning them. Frame resolution that
+would otherwise be ambiguous (e.g. two sibling iframes sharing a `name` or
+overlapping `src`) is rejected with an error rather than silently guessing
+and risking action in the wrong origin — see the `frame_selector` docs on
+`browser_iframe_click`/`_fill`/`_read` for the current known limitations
+(no CSS-aware `>>` escaping, no redirect tracking).
 
 **v0.1.14 — managed hosting security.** browser-rs can now run behind a
 trusted host (like an agent platform) that spins up one server for many
@@ -211,11 +230,11 @@ whole section — it only activates when a host explicitly configures it.
 
 ## Tools
 
-MCP exposes 64 `browser_*` tools:
+MCP exposes 65 `browser_*` tools:
 
 **Navigation and inspection:** `browser_navigate` · `browser_new_page` · `browser_snapshot` · `browser_activate_page` · `browser_read` · `browser_get_visible_html` · `browser_get_visible_text` · `browser_find` · `browser_take_screenshot` · `browser_save_pdf` · `browser_pages` · `browser_tabs` · `browser_switch_page` · `browser_profile` · `browser_status`
 
-**Interaction:** `browser_click` · `browser_wheel` · `browser_type` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_close_page` · `browser_close`
+**Interaction:** `browser_click` · `browser_wheel` · `browser_type` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_iframe_read` · `browser_close_page` · `browser_close`
 
 Use `browser_activate_page({ "page": "p5" })` before automating a background
 tab whose site throttles lazy loading. It calls CDP `Target.activateTarget`,

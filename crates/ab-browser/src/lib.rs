@@ -367,6 +367,190 @@ struct RouteState {
     loop_started: bool,
 }
 
+/// What to extract in `iframe_read` / `FrameAction::Read`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadMode {
+    /// `element.outerHTML`.
+    Html,
+    /// `element.innerText` (falls back to `textContent`).
+    Text,
+}
+
+/// Action to perform on the element resolved at the bottom of an iframe chain
+/// (see `Page::descend_and_act`).
+enum FrameAction<'a> {
+    Click,
+    Fill(&'a str),
+    Read(ReadMode),
+}
+
+/// Split a `frame_selector` argument into a chain of CSS selectors. Chains
+/// are written Playwright-style as `"sel1 >> sel2 >> sel3"`, each hop naming
+/// the `<iframe>` to descend into next; the last selector passed separately
+/// to `iframe_click`/`iframe_fill` targets the element inside the innermost
+/// frame. A plain selector with no `>>` is a chain of length one (single
+/// iframe hop), matching the pre-existing single-level API.
+///
+/// Known limitation: this is a naive `str::split`, not a CSS-aware parser.
+/// A selector containing a literal `>>` substring inside a quoted attribute
+/// value (e.g. `iframe[src*="a>>b"]`) will be incorrectly split into two
+/// bogus hops. This is not expected in practice (`>>` is vanishingly rare in
+/// real URLs/selectors) but is a known gap, not a supported escape hatch.
+fn split_frame_chain(frame_selector: &str) -> Vec<&str> {
+    frame_selector
+        .split(">>")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Split and validate a `frame_selector` argument, rejecting empty/
+/// whitespace/`>>`-only input up front. Without this, an accidentally empty
+/// `frame_selector` (e.g. a caller-side templating bug) would silently
+/// resolve to a zero-length chain and `descend_and_act` would act directly
+/// on the *top-level* document — which for `iframe_click`/`iframe_fill`
+/// means clicking/filling something on the main page while the caller
+/// believes they're targeting content inside an iframe.
+fn require_frame_chain(frame_selector: &str) -> Result<Vec<&str>> {
+    let chain = split_frame_chain(frame_selector);
+    if chain.is_empty() {
+        return Err(BrowserError::Protocol(format!(
+            "frame_selector must contain at least one iframe CSS selector \
+             (got {frame_selector:?}, which is empty/whitespace/'>>'-only)"
+        )));
+    }
+    Ok(chain)
+}
+
+/// Build the JS body executed at each hop of `descend_and_act`. It walks
+/// `chain` from the current document, hopping through `contentDocument` at
+/// each step. If every hop is same-origin, it performs `action` on
+/// `selector` in the innermost document and returns `{ok:true, ...}` (with a
+/// `value` field for `FrameAction::Read`). The first time `contentDocument`
+/// comes back null — cross-origin — it stops and returns
+/// `{ok:false, index, src, name}` describing the boundary iframe element
+/// (whose attributes remain readable even though its document does not), so
+/// the caller can resume via CDP.
+fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction<'_>) -> String {
+    let chain_json = serde_json::to_string(chain).unwrap_or_else(|_| "[]".into());
+    let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
+    let act_js = match action {
+        FrameAction::Click => "el.click(); return { ok: true };".to_string(),
+        FrameAction::Fill(value) => format!(
+            "el.focus(); el.value={v}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return {{ ok: true }};",
+            v = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
+        ),
+        FrameAction::Read(ReadMode::Html) => "return { ok: true, value: el.outerHTML };".to_string(),
+        FrameAction::Read(ReadMode::Text) => {
+            "return { ok: true, value: (el.innerText !== undefined ? el.innerText : (el.textContent || '')) };"
+                .to_string()
+        }
+    };
+    format!(
+        r#"(() => {{
+  const chain = {chain_json};
+  let doc = document;
+  for (let i = 0; i < chain.length; i++) {{
+    const f = doc.querySelector(chain[i]);
+    if (!f) throw new Error('iframe not found at step ' + i + ': ' + chain[i]);
+    let inner = null;
+    try {{ inner = f.contentDocument; }} catch (e) {{ inner = null; }}
+    if (!inner) {{
+      return {{ ok: false, index: i, src: f.src || f.getAttribute('src') || '', name: f.name || f.getAttribute('name') || '' }};
+    }}
+    doc = inner;
+  }}
+  const el = doc.querySelector({sel_json});
+  if (!el) throw new Error('element not found: ' + {sel_json});
+  {act_js}
+}})()"#
+    )
+}
+
+/// Flatten a `Page.getFrameTree` response into `(frameId, name, url)` triples
+/// for every frame, regardless of nesting depth or origin. Pulled out as a
+/// standalone function (rather than a closure inside `frame_id_by_hint`) so
+/// the matching logic in `resolve_frame_id` can be unit-tested against
+/// hand-built fixtures without a live CDP connection.
+fn collect_frames<'a>(node: &'a Value, out: &mut Vec<(&'a str, &'a str, &'a str)>) {
+    if let Some(frame) = node.get("frame") {
+        let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
+        let fname = frame.get("name").and_then(Value::as_str).unwrap_or("");
+        let furl = frame.get("url").and_then(Value::as_str).unwrap_or("");
+        if !id.is_empty() {
+            out.push((id, fname, furl));
+        }
+    }
+    for child in node
+        .get("childFrames")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        collect_frames(child, out);
+    }
+}
+
+/// Resolve a single frame id from a flattened frame list by `name` or `src`
+/// hint. `name` is preferred and matched exactly; `src` is matched exactly
+/// against the frame's committed `url` first, then by substring (to
+/// tolerate relative-vs-absolute differences). Any hint that matches *more
+/// than one* frame is rejected as ambiguous rather than silently resolved to
+/// the first entry — see `Page::frame_id_by_hint` doc comment for the
+/// rationale and known limitations (non-unique names/URLs, redirects).
+fn resolve_frame_id(frames: &[(&str, &str, &str)], name: &str, src: &str) -> Result<String> {
+    let ambiguous = |what: &str, matched: &[&str]| {
+        BrowserError::Protocol(format!(
+            "ambiguous cross-origin iframe: {} frames match {what} (name={name:?}, src={src:?}); \
+             give the iframe a unique name/id, or use a `>>` chain hop that narrows the search",
+            matched.len()
+        ))
+    };
+
+    if !name.is_empty() {
+        let matches: Vec<&str> = frames
+            .iter()
+            .filter(|(_, fname, _)| *fname == name)
+            .map(|(id, _, _)| *id)
+            .collect();
+        match matches.len() {
+            0 => {} // fall through to src matching
+            1 => return Ok(matches[0].to_string()),
+            _ => return Err(ambiguous("by name", &matches)),
+        }
+    }
+
+    if !src.is_empty() {
+        let exact: Vec<&str> = frames
+            .iter()
+            .filter(|(_, _, furl)| *furl == src)
+            .map(|(id, _, _)| *id)
+            .collect();
+        match exact.len() {
+            1 => return Ok(exact[0].to_string()),
+            n if n > 1 => return Err(ambiguous("exactly by url", &exact)),
+            _ => {}
+        }
+
+        let sub: Vec<&str> = frames
+            .iter()
+            .filter(|(_, _, furl)| !furl.is_empty() && (furl.contains(src) || src.contains(*furl)))
+            .map(|(id, _, _)| *id)
+            .collect();
+        match sub.len() {
+            1 => return Ok(sub[0].to_string()),
+            n if n > 1 => return Err(ambiguous("loosely by url substring", &sub)),
+            _ => {}
+        }
+    }
+
+    Err(BrowserError::Protocol(format!(
+        "cross-origin iframe not found in frame tree (name={name:?}, src={src:?}); \
+         note: a frame that redirected or navigated after load may no longer have a \
+         URL containing its original `src` attribute"
+    )))
+}
+
 /// A single attached tab.
 #[derive(Clone)]
 pub struct Page {
@@ -1263,32 +1447,207 @@ impl Page {
         }
     }
 
-    /// Click an element inside a same-origin iframe (main-world JS).
+    /// Click an element inside an iframe. `frame_selector` may chain multiple
+    /// CSS selectors with `>>` to descend through nested iframes (e.g.
+    /// `"iframe.wrapper >> iframe.popup"`). Same-origin frames are resolved
+    /// with a single main-world JS round trip; if a cross-origin boundary is
+    /// hit, resolution automatically falls back to CDP (`Page.getFrameTree` +
+    /// `Page.createIsolatedWorld`), which is not subject to the Same-Origin
+    /// Policy. See `descend_and_act` for the mechanism.
     pub async fn iframe_click(&self, frame_selector: &str, selector: &str) -> Result<()> {
-        let js = format!(
-            r#"(() => {{ const f=document.querySelector({fs}); const d=f&&(f.contentDocument||(f.contentWindow&&f.contentWindow.document)); const el=d&&d.querySelector({s}); if(!el) throw new Error('iframe element not found'); el.click(); return true; }})()"#,
-            fs = serde_json::to_string(frame_selector).unwrap_or_else(|_| "\"\"".into()),
-            s = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
-        );
-        self.evaluate_main(&js).await?;
+        let chain = require_frame_chain(frame_selector)?;
+        self.descend_and_act(&chain, selector, &FrameAction::Click)
+            .await?;
         Ok(())
     }
 
-    /// Fill an input inside a same-origin iframe (main-world JS).
+    /// Fill an input inside an iframe. See `iframe_click` for the
+    /// same-origin/cross-origin resolution behavior and the `>>` chaining
+    /// syntax for nested iframes.
     pub async fn iframe_fill(
         &self,
         frame_selector: &str,
         selector: &str,
         value: &str,
     ) -> Result<()> {
-        let js = format!(
-            r#"(() => {{ const f=document.querySelector({fs}); const d=f&&(f.contentDocument||(f.contentWindow&&f.contentWindow.document)); const el=d&&d.querySelector({s}); if(!el) throw new Error('iframe element not found'); el.focus(); el.value={v}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return true; }})()"#,
-            fs = serde_json::to_string(frame_selector).unwrap_or_else(|_| "\"\"".into()),
-            s = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
-            v = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
-        );
-        self.evaluate_main(&js).await?;
+        let chain = require_frame_chain(frame_selector)?;
+        self.descend_and_act(&chain, selector, &FrameAction::Fill(value))
+            .await?;
         Ok(())
+    }
+
+    /// Read an element's `outerHTML` (`ReadMode::Html`) or rendered text
+    /// (`ReadMode::Text`) from inside an iframe. `frame_selector` may be a
+    /// single CSS selector or a `>>`-separated chain for nested iframes, and
+    /// `selector` targets the element inside the innermost one (pass `"html"`
+    /// to read the whole frame document). Same-origin and cross-origin
+    /// frames are both supported — see `iframe_click` for the resolution
+    /// mechanism, which this reuses verbatim.
+    pub async fn iframe_read(
+        &self,
+        frame_selector: &str,
+        selector: &str,
+        mode: ReadMode,
+    ) -> Result<String> {
+        let chain = require_frame_chain(frame_selector)?;
+        let result = self
+            .descend_and_act(&chain, selector, &FrameAction::Read(mode))
+            .await?;
+        Ok(result
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// Descend through a chain of iframe selectors and perform `action` on
+    /// `selector` inside the innermost one, returning the JS result object
+    /// (`{ok:true, value?}` for `FrameAction::Read`; `{ok:true}` otherwise).
+    /// Each hop first tries same-origin DOM access (`contentDocument`,
+    /// cheap, one round trip per contiguous same-origin run). When that
+    /// returns null — the SOP signature of a cross-origin frame — the
+    /// boundary iframe's `src`/`name` (still readable from its accessible
+    /// parent document) is used to locate the matching frame in the CDP
+    /// frame tree, and a fresh isolated execution context is created
+    /// *inside that frame's own origin* via `Page.createIsolatedWorld`. CDP
+    /// frame contexts are not subject to the Same-Origin Policy, so this
+    /// works regardless of how many cross-origin boundaries are crossed.
+    /// The loop repeats until the full chain is consumed.
+    async fn descend_and_act(
+        &self,
+        chain: &[&str],
+        selector: &str,
+        action: &FrameAction<'_>,
+    ) -> Result<Value> {
+        let mut context_id: Option<i64> = None;
+        let mut remaining: Vec<&str> = chain.to_vec();
+        // Bound the loop: at most one CDP hop per chain element, plus one.
+        for _ in 0..=chain.len() {
+            let js = build_descend_js(&remaining, selector, action);
+            let result = match context_id {
+                None => self.evaluate_main(&js).await?,
+                Some(ctx) => self.eval_with_context(&js, ctx).await?,
+            };
+            if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                return Ok(result);
+            }
+            let index = result.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let src = result
+                .get("src")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let name = result
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if src.is_empty() && name.is_empty() {
+                // The iframe element *was* found (that's how we got its src/
+                // name attributes at all) — it's cross-origin and simply has
+                // neither attribute set, so there's nothing to match it by
+                // in the CDP frame tree. E.g. a sandboxed `srcdoc` iframe
+                // without `allow-same-origin`. Do not say "not found" here;
+                // that would misdirect debugging toward the selector itself.
+                return Err(BrowserError::Protocol(format!(
+                    "iframe at step {index} (`{}`) is cross-origin but has neither a `name` \
+                     nor a `src` attribute, so it can't be located in the CDP frame tree \
+                     (e.g. a sandboxed `srcdoc` iframe without `allow-same-origin`); \
+                     give it a unique `name` or `id` attribute to make it addressable",
+                    remaining.get(index).copied().unwrap_or("")
+                )));
+            }
+            let frame_id = self.frame_id_by_hint(&name, &src).await?;
+            context_id = Some(self.create_isolated_world_for_frame(&frame_id).await?);
+            remaining = remaining[index + 1..].to_vec();
+        }
+        Err(BrowserError::Protocol(
+            "iframe descent exceeded max depth (possible frame-tree cycle)".into(),
+        ))
+    }
+
+    /// Find a frame in the CDP frame tree by iframe `name` or `src` hint.
+    ///
+    /// `name` is matched exactly (CDP's `Frame.name` mirrors the iframe
+    /// element's `name` attribute) and is preferred when present. `src`
+    /// falls back to an exact match against the frame's resolved `url`
+    /// first, then a substring match to tolerate relative-vs-absolute
+    /// differences. This is not affected by cross-origin restrictions:
+    /// `Page.getFrameTree` enumerates every frame regardless of origin.
+    ///
+    /// Known limitation: none of these hints are guaranteed unique. If two
+    /// sibling iframes share a `name`/`url` (or a redirected/subsequently
+    /// navigated frame's committed `url` no longer contains the iframe's
+    /// original `src` attribute at all), this can fail to disambiguate or
+    /// fail to match. Rather than silently guessing (and risking reading
+    /// from or acting on the wrong origin), an ambiguous hint is treated as
+    /// an error — see `IframeReadArgs`/tool docs for the `>>` chain
+    /// workaround (make the hop more specific, e.g. by nesting further or
+    /// giving the iframe a unique `name`/`id`).
+    async fn frame_id_by_hint(&self, name: &str, src: &str) -> Result<String> {
+        let tree = self
+            .client
+            .send_on(&self.session_id, "Page.getFrameTree", json!({}))
+            .await?;
+        let root = tree
+            .get("frameTree")
+            .ok_or_else(|| BrowserError::Protocol("no frame tree".into()))?;
+
+        let mut frames = Vec::new();
+        collect_frames(root, &mut frames);
+        resolve_frame_id(&frames, name, src)
+    }
+
+    /// Create an isolated JS world scoped to `frame_id` and return its
+    /// execution context id. Because this targets the frame directly (not
+    /// via `window.frames[...]` from a different origin), it is exempt from
+    /// the Same-Origin Policy that blocks `contentDocument` access.
+    async fn create_isolated_world_for_frame(&self, frame_id: &str) -> Result<i64> {
+        let w = self
+            .client
+            .send_on(
+                &self.session_id,
+                "Page.createIsolatedWorld",
+                json!({
+                    "frameId": frame_id,
+                    "worldName": "ab_cross_frame",
+                    "grantUniveralAccess": false,
+                }),
+            )
+            .await?;
+        w.get("executionContextId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                BrowserError::Protocol(
+                    "failed to create isolated world for cross-origin frame".into(),
+                )
+            })
+    }
+
+    /// Evaluate `expression` in a specific execution context (used for the
+    /// isolated worlds created for cross-origin frames above).
+    async fn eval_with_context(&self, expression: &str, context_id: i64) -> Result<Value> {
+        let res = self
+            .client
+            .send_on(
+                &self.session_id,
+                "Runtime.evaluate",
+                json!({
+                    "expression": expression,
+                    "contextId": context_id,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await?;
+        if let Some(exc) = res.get("exceptionDetails") {
+            return Err(BrowserError::Protocol(format!("JS exception: {exc}")));
+        }
+        Ok(res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null))
     }
 
     /// Start capturing console messages. Enables the Runtime domain (a stealth
@@ -2275,12 +2634,142 @@ async fn discover_ws_url(port: u16) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::activation_verified;
+    use super::{
+        activation_verified, build_descend_js, require_frame_chain, resolve_frame_id,
+        split_frame_chain, FrameAction, ReadMode,
+    };
 
     #[test]
     fn activation_requires_visible_and_focused_document() {
         assert!(activation_verified("visible", true));
         assert!(!activation_verified("visible", false));
         assert!(!activation_verified("hidden", true));
+    }
+
+    #[test]
+    fn frame_chain_splits_on_double_arrow_and_trims_whitespace() {
+        assert_eq!(split_frame_chain("iframe.a"), vec!["iframe.a"]);
+        assert_eq!(
+            split_frame_chain("iframe.wrapper >> iframe.popup"),
+            vec!["iframe.wrapper", "iframe.popup"]
+        );
+        assert_eq!(
+            split_frame_chain("  iframe.a  >>iframe.b>>  iframe.c "),
+            vec!["iframe.a", "iframe.b", "iframe.c"]
+        );
+    }
+
+    #[test]
+    fn frame_chain_ignores_empty_segments() {
+        // Defensive: a stray leading/trailing/double ">>" shouldn't produce
+        // empty selectors that would blow up `document.querySelector("")`.
+        assert_eq!(split_frame_chain(">> iframe.a >>"), vec!["iframe.a"]);
+        assert_eq!(split_frame_chain(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn descend_js_embeds_chain_and_selector_as_json_and_performs_click() {
+        let js = build_descend_js(&["iframe#f"], "button#go", &FrameAction::Click);
+        assert!(js.contains(r#"["iframe#f"]"#));
+        assert!(js.contains(r#"querySelector("button#go")"#));
+        assert!(js.contains("el.click();"));
+        assert!(js.contains("ok: false"));
+        assert!(js.contains("ok: true"));
+    }
+
+    #[test]
+    fn descend_js_fill_sets_value_and_dispatches_events() {
+        let js = build_descend_js(&[], "input#q", &FrameAction::Fill("hello \"world\""));
+        // No frame hops: chain is empty, so it should act directly.
+        assert!(js.contains(r#"const chain = [];"#));
+        assert!(js.contains(r#"el.value="hello \"world\"";"#));
+        assert!(js.contains("dispatchEvent(new Event('input'"));
+        assert!(js.contains("dispatchEvent(new Event('change'"));
+    }
+
+    #[test]
+    fn descend_js_read_html_returns_outer_html() {
+        let js = build_descend_js(&["iframe#f"], "body", &FrameAction::Read(ReadMode::Html));
+        assert!(js.contains("value: el.outerHTML"));
+        assert!(js.contains("ok: true"));
+    }
+
+    #[test]
+    fn descend_js_read_text_falls_back_to_text_content() {
+        let js = build_descend_js(&[], "#result", &FrameAction::Read(ReadMode::Text));
+        assert!(js.contains("el.innerText"));
+        assert!(js.contains("el.textContent"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_frame_selector_is_rejected() {
+        assert!(require_frame_chain("").is_err());
+        assert!(require_frame_chain("   ").is_err());
+        assert!(require_frame_chain(">>").is_err());
+        assert!(require_frame_chain(" >> >> ").is_err());
+        assert_eq!(require_frame_chain("iframe.a").unwrap(), vec!["iframe.a"]);
+    }
+
+    #[test]
+    fn resolve_frame_id_prefers_unique_name_over_url() {
+        let frames = vec![
+            ("f1", "main", "https://a.example/"),
+            ("f2", "payment", "https://pay.example/checkout"),
+        ];
+        assert_eq!(resolve_frame_id(&frames, "payment", "").unwrap(), "f2");
+        assert_eq!(
+            resolve_frame_id(&frames, "", "https://pay.example/checkout").unwrap(),
+            "f2"
+        );
+    }
+
+    #[test]
+    fn resolve_frame_id_rejects_ambiguous_name() {
+        // Two sibling iframes with the same `name` — regression check for
+        // the original bug where the first DFS hit silently won, risking
+        // reading from / acting on the wrong origin.
+        let frames = vec![
+            ("f1", "ad-slot", "https://ads1.example/"),
+            ("f2", "ad-slot", "https://ads2.example/"),
+        ];
+        let err = resolve_frame_id(&frames, "ad-slot", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_frame_id_rejects_ambiguous_url_substring() {
+        let frames = vec![
+            ("f1", "", "https://cdn.example/widget?id=1"),
+            ("f2", "", "https://cdn.example/widget?id=2"),
+        ];
+        let err = resolve_frame_id(&frames, "", "cdn.example/widget")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_frame_id_exact_url_match_wins_over_multiple_substring_matches() {
+        // Exact match should short-circuit before the looser substring pass
+        // even when other frames would also substring-match.
+        let frames = vec![
+            ("f1", "", "https://cdn.example/widget"),
+            ("f2", "", "https://cdn.example/widget/v2"),
+        ];
+        assert_eq!(
+            resolve_frame_id(&frames, "", "https://cdn.example/widget").unwrap(),
+            "f1"
+        );
+    }
+
+    #[test]
+    fn resolve_frame_id_errors_when_nothing_matches() {
+        let frames = vec![("f1", "", "https://a.example/")];
+        let err = resolve_frame_id(&frames, "nope", "https://b.example/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "unexpected error: {err}");
     }
 }
