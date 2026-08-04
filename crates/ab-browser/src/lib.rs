@@ -467,6 +467,29 @@ fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction<'_>) ->
     )
 }
 
+/// Build an expression that returns the iframe element at `index`, walking
+/// any preceding same-origin iframe hops from the current execution context.
+fn build_frame_element_js(chain: &[&str], index: usize) -> String {
+    let path = chain.get(..=index).unwrap_or(chain);
+    let path_json = serde_json::to_string(path).unwrap_or_else(|_| "[]".into());
+    format!(
+        r#"(() => {{
+  const chain = {path_json};
+  let doc = document;
+  for (let i = 0; i < chain.length; i++) {{
+    const f = doc.querySelector(chain[i]);
+    if (!f) throw new Error('iframe not found at step ' + i + ': ' + chain[i]);
+    if (i === chain.length - 1) return f;
+    let inner = null;
+    try {{ inner = f.contentDocument; }} catch (e) {{ inner = null; }}
+    if (!inner) throw new Error('iframe at step ' + i + ' became cross-origin');
+    doc = inner;
+  }}
+  throw new Error('iframe path is empty');
+}})()"#
+    )
+}
+
 /// Flatten a `Page.getFrameTree` response into `(frameId, name, url)` triples
 /// for every frame, regardless of nesting depth or origin. Pulled out as a
 /// standalone function (rather than a closure inside `frame_id_by_hint`) so
@@ -544,11 +567,21 @@ fn resolve_frame_id(frames: &[(&str, &str, &str)], name: &str, src: &str) -> Res
         }
     }
 
-    Err(BrowserError::Protocol(format!(
-        "cross-origin iframe not found in frame tree (name={name:?}, src={src:?}); \
-         note: a frame that redirected or navigated after load may no longer have a \
-         URL containing its original `src` attribute"
-    )))
+    Err(BrowserError::Protocol({
+        let urls: Vec<&str> = frames
+            .iter()
+            .map(|(_, _, u)| *u)
+            .filter(|u| !u.is_empty())
+            .collect();
+        format!(
+            "cross-origin iframe not found in frame tree (name={name:?}, src={src:?}); \
+             {n} frames in tree: {urls:?}. \
+             note: a frame that redirected or navigated after load may no longer have a \
+             URL containing its original `src` attribute; \
+             the caller may retry by resolving the iframe DOM node directly",
+            n = frames.len(),
+        )
+    }))
 }
 
 /// A single attached tab.
@@ -1506,13 +1539,13 @@ impl Page {
     /// Each hop first tries same-origin DOM access (`contentDocument`,
     /// cheap, one round trip per contiguous same-origin run). When that
     /// returns null — the SOP signature of a cross-origin frame — the
-    /// boundary iframe's `src`/`name` (still readable from its accessible
-    /// parent document) is used to locate the matching frame in the CDP
-    /// frame tree, and a fresh isolated execution context is created
-    /// *inside that frame's own origin* via `Page.createIsolatedWorld`. CDP
-    /// frame contexts are not subject to the Same-Origin Policy, so this
-    /// works regardless of how many cross-origin boundaries are crossed.
-    /// The loop repeats until the full chain is consumed.
+    /// boundary iframe element is resolved directly to its CDP `frameId` via
+    /// `DOM.describeNode`; URL/name matching in `Page.getFrameTree` remains a
+    /// compatibility fallback. A fresh isolated execution context is then
+    /// created *inside that frame's own origin* via
+    /// `Page.createIsolatedWorld`. CDP frame contexts are not subject to the
+    /// Same-Origin Policy, so the loop can repeat across multiple origin
+    /// boundaries until the full chain is consumed.
     async fn descend_and_act(
         &self,
         chain: &[&str],
@@ -1542,22 +1575,31 @@ impl Page {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            if src.is_empty() && name.is_empty() {
-                // The iframe element *was* found (that's how we got its src/
-                // name attributes at all) — it's cross-origin and simply has
-                // neither attribute set, so there's nothing to match it by
-                // in the CDP frame tree. E.g. a sandboxed `srcdoc` iframe
-                // without `allow-same-origin`. Do not say "not found" here;
-                // that would misdirect debugging toward the selector itself.
-                return Err(BrowserError::Protocol(format!(
-                    "iframe at step {index} (`{}`) is cross-origin but has neither a `name` \
-                     nor a `src` attribute, so it can't be located in the CDP frame tree \
-                     (e.g. a sandboxed `srcdoc` iframe without `allow-same-origin`); \
-                     give it a unique `name` or `id` attribute to make it addressable",
-                    remaining.get(index).copied().unwrap_or("")
-                )));
-            }
-            let frame_id = self.frame_id_by_hint(&name, &src).await?;
+            // Resolve the exact DOM element first. Besides avoiding ambiguous
+            // URL/name matching, this works when a nested frame is absent from
+            // the frame tree returned for this CDP session.
+            let frame_id = match self.frame_id_by_node(&remaining, index, context_id).await {
+                Ok(id) => id,
+                Err(node_err) if !name.is_empty() || !src.is_empty() => {
+                    match self.frame_id_by_hint(&name, &src).await {
+                        Ok(id) => id,
+                        Err(hint_err) => {
+                            return Err(BrowserError::Protocol(format!(
+                                "cross-origin iframe could not be resolved from its DOM node: \
+                                 {node_err}; frame-tree hint lookup also failed \
+                                 (name={name:?}, src={src:?}): {hint_err}"
+                            )));
+                        }
+                    }
+                }
+                Err(node_err) => {
+                    return Err(BrowserError::Protocol(format!(
+                        "cross-origin iframe `{}` has no name/src fallback and could not be \
+                         resolved from its DOM node: {node_err}",
+                        remaining.get(index).copied().unwrap_or("")
+                    )));
+                }
+            };
             context_id = Some(self.create_isolated_world_for_frame(&frame_id).await?);
             remaining = remaining[index + 1..].to_vec();
         }
@@ -1624,6 +1666,74 @@ impl Page {
             })
     }
 
+    /// Resolve a cross-origin iframe to its `frameId` by querying the iframe
+    /// element from its *parent* document (the current execution context) and
+    /// using `DOM.describeNode` to read the `frameId` directly.
+    ///
+    /// This bypasses `Page.getFrameTree` entirely and binds the selected DOM
+    /// element to its frame without relying on non-unique URL/name hints.
+    ///
+    /// `chain[..=index]` is the path from the current execution context down
+    /// to the cross-origin iframe element. The last hop (`chain[index]`) is the
+    /// target iframe whose frameId we want; earlier hops are walked via
+    /// same-origin `contentDocument` access (which the caller has already
+    /// verified is possible).
+    async fn frame_id_by_node(
+        &self,
+        chain: &[&str],
+        index: usize,
+        context_id: Option<i64>,
+    ) -> Result<String> {
+        let js = build_frame_element_js(chain, index);
+        let res = self.eval_remote(&js, context_id).await?;
+        let result = res
+            .get("result")
+            .ok_or_else(|| BrowserError::Protocol("DOM query returned no result".into()))?;
+        let object_id = result
+            .get("objectId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserError::Protocol(format!(
+                    "iframe element `{}` did not return a remote object \
+                     (type: {:?}, subtype: {:?}); the selector may not match \
+                     an <iframe> element",
+                    chain.get(index).copied().unwrap_or(""),
+                    result.get("type").and_then(Value::as_str),
+                    result.get("subtype").and_then(Value::as_str),
+                ))
+            })?;
+        let desc = self
+            .client
+            .send_on(
+                &self.session_id,
+                "DOM.describeNode",
+                json!({ "objectId": object_id }),
+            )
+            .await;
+        // Runtime object handles otherwise remain alive until their context is
+        // destroyed. Ignore release failures so they do not mask the result.
+        let _ = self
+            .client
+            .send_on(
+                &self.session_id,
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+            )
+            .await;
+        let desc = desc?;
+        desc.get("node")
+            .and_then(|n| n.get("frameId"))
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| {
+                BrowserError::Protocol(format!(
+                    "iframe element `{}` resolved but DOM.describeNode returned no frameId \
+                     (the element may not be an iframe, or it hasn't finished loading)",
+                    chain.get(index).copied().unwrap_or("")
+                ))
+            })
+    }
+
     /// Evaluate `expression` in a specific execution context (used for the
     /// isolated worlds created for cross-origin frames above).
     async fn eval_with_context(&self, expression: &str, context_id: i64) -> Result<Value> {
@@ -1648,6 +1758,30 @@ impl Page {
             .and_then(|r| r.get("value"))
             .cloned()
             .unwrap_or(Value::Null))
+    }
+
+    /// Like `eval_with_context` / `evaluate_main`, but with
+    /// `returnByValue: false` so the result may include `objectId`
+    /// references for non-primitive values (e.g. DOM elements).
+    /// Used by `frame_id_by_node` to resolve an iframe element to its
+    /// CDP frame id via `DOM.describeNode`.
+    async fn eval_remote(&self, expression: &str, context_id: Option<i64>) -> Result<Value> {
+        let mut params = json!({
+            "expression": expression,
+            "returnByValue": false,
+            "awaitPromise": true,
+        });
+        if let Some(ctx) = context_id {
+            params["contextId"] = json!(ctx);
+        }
+        let res = self
+            .client
+            .send_on(&self.session_id, "Runtime.evaluate", params)
+            .await?;
+        if let Some(exc) = res.get("exceptionDetails") {
+            return Err(BrowserError::Protocol(format!("JS exception: {exc}")));
+        }
+        Ok(res)
     }
 
     /// Start capturing console messages. Enables the Runtime domain (a stealth
@@ -2635,8 +2769,8 @@ async fn discover_ws_url(port: u16) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_verified, build_descend_js, require_frame_chain, resolve_frame_id,
-        split_frame_chain, FrameAction, ReadMode,
+        activation_verified, build_descend_js, build_frame_element_js, require_frame_chain,
+        resolve_frame_id, split_frame_chain, FrameAction, ReadMode,
     };
 
     #[test]
@@ -2699,6 +2833,19 @@ mod tests {
         let js = build_descend_js(&[], "#result", &FrameAction::Read(ReadMode::Text));
         assert!(js.contains("el.innerText"));
         assert!(js.contains("el.textContent"));
+    }
+
+    #[test]
+    fn frame_element_js_uses_path_relative_to_current_context() {
+        let js = build_frame_element_js(&["iframe.same-origin", "iframe.cross-origin"], 1);
+        assert!(js.contains(r#"["iframe.same-origin","iframe.cross-origin"]"#));
+
+        // After crossing the first origin boundary, callers pass only the
+        // remaining chain. The generated query must not restart at the page's
+        // original top-level selector.
+        let js = build_frame_element_js(&["iframe.inner-wrapper", "iframe.payment"], 1);
+        assert!(js.contains(r#"["iframe.inner-wrapper","iframe.payment"]"#));
+        assert!(!js.contains("iframe.same-origin"));
     }
 
     #[test]
