@@ -542,15 +542,11 @@ struct UploadArgs {
 //   (e.g. `iframe[src*="a>>b"]`) will be mis-split into two bogus hops.
 //   `>>` is vanishingly rare in real selectors/URLs, but this is a real gap,
 //   not a supported escape hatch — avoid `>>` inside selector strings.
-// - Cross-origin frames are located by the iframe element's `name`/`src`
-//   attributes, matched against the CDP frame tree. If a frame redirects or
-//   navigates itself after the initial load, its committed URL may no
-//   longer contain the original `src` and it becomes unresolvable — give
-//   such iframes a stable `name`/`id` instead of relying on `src` matching.
-// - If two iframes share the same `name` or a matching/overlapping `src`,
-//   resolution is intentionally rejected as "ambiguous" (an error) rather
-//   than silently guessing and risking action in the wrong origin —
-//   disambiguate with a more specific chain hop or a unique `name`/`id`.
+// - Cross-origin frames are normally resolved from the selected iframe DOM
+//   node, including OOPIFs in a separate renderer process. `name`/`src`
+//   matching against the CDP frame tree remains a compatibility fallback.
+//   If that fallback is needed, redirects and duplicate attributes can make
+//   it unresolvable or ambiguous; use a specific chain hop or unique id/name.
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct IframeClickArgs {

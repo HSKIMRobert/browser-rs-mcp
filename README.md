@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-AB_VERSION=v0.1.18 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
+AB_VERSION=v0.1.19 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,16 +90,21 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.1.18)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.1.19)</strong></summary>
+
+**v0.1.19 — out-of-process iframe support.** Cross-origin iframe actions now
+route CDP commands through the iframe target's own flatten-mode session when
+Chrome Site Isolation places it in a separate renderer process (OOPIF). The
+session is carried together with the execution context through nested frame
+chains and reused across calls. This fixes structures such as a same-origin
+wrapper containing a cross-origin Kakao postcode iframe. The public iframe
+tool interfaces remain unchanged.
 
 **v0.1.18 — nested cross-origin iframe resolution.** The iframe tools now
 resolve the selected iframe element directly to its CDP frame ID before
-falling back to URL/name matching. This fixes same-origin wrapper iframes
-containing a cross-origin iframe, supports repeated cross-origin boundaries
-using paths relative to the current frame context, and also handles frames
-without `src` or `name` attributes. The public `browser_iframe_read`,
-`browser_iframe_click`, and `browser_iframe_fill` tool interfaces are
-unchanged.
+falling back to URL/name matching, keep paths relative to the current frame
+context across repeated origin boundaries, and handle frames without `src` or
+`name` attributes. OOPIF target-session routing is completed in v0.1.19.
 
 **v0.1.17 — cross-origin iframe support.** `browser_iframe_click` and
 `browser_iframe_fill` now work on cross-origin iframes, not just same-origin

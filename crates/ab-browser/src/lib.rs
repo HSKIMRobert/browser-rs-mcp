@@ -332,6 +332,7 @@ impl Browser {
             client: self.client.clone(),
             session_id,
             target_id: target_id.to_string(),
+            frame_sessions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "macos")]
             browser_pid: self.child.as_ref().and_then(Child::id),
             pointer: Arc::new(Mutex::new(None)),
@@ -590,6 +591,9 @@ pub struct Page {
     client: CdpClient,
     session_id: String,
     target_id: String,
+    /// Flatten-mode CDP sessions attached to out-of-process iframe targets,
+    /// keyed by the frame/target id returned from `DOM.describeNode`.
+    frame_sessions: Arc<Mutex<HashMap<String, String>>>,
     /// Browser process launched by this crate. Used only for a best-effort
     /// macOS foreground fallback; externally connected browsers leave it unset.
     #[cfg(target_os = "macos")]
@@ -602,6 +606,12 @@ pub struct Page {
     dialog: Arc<Mutex<(bool, Option<String>)>>,
     /// Network mock rules + intercept-loop state.
     routes: Arc<Mutex<RouteState>>,
+}
+
+#[derive(Clone, Debug)]
+struct FrameExecutionContext {
+    session_id: String,
+    context_id: i64,
 }
 
 impl Page {
@@ -1552,12 +1562,12 @@ impl Page {
         selector: &str,
         action: &FrameAction<'_>,
     ) -> Result<Value> {
-        let mut context_id: Option<i64> = None;
+        let mut context: Option<FrameExecutionContext> = None;
         let mut remaining: Vec<&str> = chain.to_vec();
         // Bound the loop: at most one CDP hop per chain element, plus one.
         for _ in 0..=chain.len() {
             let js = build_descend_js(&remaining, selector, action);
-            let result = match context_id {
+            let result = match context.as_ref() {
                 None => self.evaluate_main(&js).await?,
                 Some(ctx) => self.eval_with_context(&js, ctx).await?,
             };
@@ -1578,7 +1588,10 @@ impl Page {
             // Resolve the exact DOM element first. Besides avoiding ambiguous
             // URL/name matching, this works when a nested frame is absent from
             // the frame tree returned for this CDP session.
-            let frame_id = match self.frame_id_by_node(&remaining, index, context_id).await {
+            let frame_id = match self
+                .frame_id_by_node(&remaining, index, context.as_ref())
+                .await
+            {
                 Ok(id) => id,
                 Err(node_err) if !name.is_empty() || !src.is_empty() => {
                     match self.frame_id_by_hint(&name, &src).await {
@@ -1600,7 +1613,14 @@ impl Page {
                     )));
                 }
             };
-            context_id = Some(self.create_isolated_world_for_frame(&frame_id).await?);
+            let parent_session = context
+                .as_ref()
+                .map(|ctx| ctx.session_id.as_str())
+                .unwrap_or(&self.session_id);
+            context = Some(
+                self.create_isolated_world_for_frame(&frame_id, parent_session)
+                    .await?,
+            );
             remaining = remaining[index + 1..].to_vec();
         }
         Err(BrowserError::Protocol(
@@ -1640,15 +1660,11 @@ impl Page {
         resolve_frame_id(&frames, name, src)
     }
 
-    /// Create an isolated JS world scoped to `frame_id` and return its
-    /// execution context id. Because this targets the frame directly (not
-    /// via `window.frames[...]` from a different origin), it is exempt from
-    /// the Same-Origin Policy that blocks `contentDocument` access.
-    async fn create_isolated_world_for_frame(&self, frame_id: &str) -> Result<i64> {
-        let w = self
+    async fn create_world_in_session(&self, session_id: &str, frame_id: &str) -> Result<i64> {
+        let world = self
             .client
             .send_on(
-                &self.session_id,
+                session_id,
                 "Page.createIsolatedWorld",
                 json!({
                     "frameId": frame_id,
@@ -1657,13 +1673,88 @@ impl Page {
                 }),
             )
             .await?;
-        w.get("executionContextId")
+        world
+            .get("executionContextId")
             .and_then(Value::as_i64)
             .ok_or_else(|| {
                 BrowserError::Protocol(
                     "failed to create isolated world for cross-origin frame".into(),
                 )
             })
+    }
+
+    async fn attach_frame_target(&self, frame_id: &str) -> Result<String> {
+        if let Some(session_id) = self.frame_sessions.lock().unwrap().get(frame_id).cloned() {
+            return Ok(session_id);
+        }
+
+        // For an out-of-process iframe Chromium uses the frame token as the
+        // iframe target id. A command scoped to the parent page session cannot
+        // address that target's Page/Runtime domains, so attach a flattened
+        // child session on the browser connection.
+        let attached = self
+            .client
+            .send(
+                "Target.attachToTarget",
+                json!({ "targetId": frame_id, "flatten": true }),
+            )
+            .await?;
+        let session_id = attached
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserError::Protocol("no OOPIF sessionId".into()))?
+            .to_string();
+        self.frame_sessions
+            .lock()
+            .unwrap()
+            .insert(frame_id.to_string(), session_id.clone());
+        Ok(session_id)
+    }
+
+    /// Create an isolated world for `frame_id`, routing the command to an
+    /// OOPIF target session when the parent session does not own that frame.
+    async fn create_isolated_world_for_frame(
+        &self,
+        frame_id: &str,
+        parent_session: &str,
+    ) -> Result<FrameExecutionContext> {
+        match self.create_world_in_session(parent_session, frame_id).await {
+            Ok(context_id) => Ok(FrameExecutionContext {
+                session_id: parent_session.to_string(),
+                context_id,
+            }),
+            Err(parent_err) => {
+                let mut session_id = self.attach_frame_target(frame_id).await.map_err(|err| {
+                    BrowserError::Protocol(format!(
+                        "frame {frame_id:?} is not owned by parent CDP session: {parent_err}; \
+                         attaching its OOPIF target also failed: {err}"
+                    ))
+                })?;
+
+                let context_id = match self.create_world_in_session(&session_id, frame_id).await {
+                    Ok(context_id) => context_id,
+                    Err(cached_err) => {
+                        // The cached session may have detached after a frame
+                        // navigation. Drop it and attach a fresh target session.
+                        self.frame_sessions.lock().unwrap().remove(frame_id);
+                        session_id = self.attach_frame_target(frame_id).await?;
+                        self.create_world_in_session(&session_id, frame_id)
+                            .await
+                            .map_err(|fresh_err| {
+                                BrowserError::Protocol(format!(
+                                    "failed to create an isolated world for OOPIF frame \
+                                     {frame_id:?}; parent session: {parent_err}; cached child \
+                                     session: {cached_err}; fresh child session: {fresh_err}"
+                                ))
+                            })?
+                    }
+                };
+                Ok(FrameExecutionContext {
+                    session_id,
+                    context_id,
+                })
+            }
+        }
     }
 
     /// Resolve a cross-origin iframe to its `frameId` by querying the iframe
@@ -1682,10 +1773,10 @@ impl Page {
         &self,
         chain: &[&str],
         index: usize,
-        context_id: Option<i64>,
+        context: Option<&FrameExecutionContext>,
     ) -> Result<String> {
         let js = build_frame_element_js(chain, index);
-        let res = self.eval_remote(&js, context_id).await?;
+        let res = self.eval_remote(&js, context).await?;
         let result = res
             .get("result")
             .ok_or_else(|| BrowserError::Protocol("DOM query returned no result".into()))?;
@@ -1702,10 +1793,13 @@ impl Page {
                     result.get("subtype").and_then(Value::as_str),
                 ))
             })?;
+        let session_id = context
+            .map(|ctx| ctx.session_id.as_str())
+            .unwrap_or(&self.session_id);
         let desc = self
             .client
             .send_on(
-                &self.session_id,
+                session_id,
                 "DOM.describeNode",
                 json!({ "objectId": object_id }),
             )
@@ -1715,7 +1809,7 @@ impl Page {
         let _ = self
             .client
             .send_on(
-                &self.session_id,
+                session_id,
                 "Runtime.releaseObject",
                 json!({ "objectId": object_id }),
             )
@@ -1736,15 +1830,19 @@ impl Page {
 
     /// Evaluate `expression` in a specific execution context (used for the
     /// isolated worlds created for cross-origin frames above).
-    async fn eval_with_context(&self, expression: &str, context_id: i64) -> Result<Value> {
+    async fn eval_with_context(
+        &self,
+        expression: &str,
+        context: &FrameExecutionContext,
+    ) -> Result<Value> {
         let res = self
             .client
             .send_on(
-                &self.session_id,
+                &context.session_id,
                 "Runtime.evaluate",
                 json!({
                     "expression": expression,
-                    "contextId": context_id,
+                    "contextId": context.context_id,
                     "returnByValue": true,
                     "awaitPromise": true,
                 }),
@@ -1765,18 +1863,25 @@ impl Page {
     /// references for non-primitive values (e.g. DOM elements).
     /// Used by `frame_id_by_node` to resolve an iframe element to its
     /// CDP frame id via `DOM.describeNode`.
-    async fn eval_remote(&self, expression: &str, context_id: Option<i64>) -> Result<Value> {
+    async fn eval_remote(
+        &self,
+        expression: &str,
+        context: Option<&FrameExecutionContext>,
+    ) -> Result<Value> {
         let mut params = json!({
             "expression": expression,
             "returnByValue": false,
             "awaitPromise": true,
         });
-        if let Some(ctx) = context_id {
-            params["contextId"] = json!(ctx);
+        if let Some(ctx) = context {
+            params["contextId"] = json!(ctx.context_id);
         }
+        let session_id = context
+            .map(|ctx| ctx.session_id.as_str())
+            .unwrap_or(&self.session_id);
         let res = self
             .client
-            .send_on(&self.session_id, "Runtime.evaluate", params)
+            .send_on(session_id, "Runtime.evaluate", params)
             .await?;
         if let Some(exc) = res.get("exceptionDetails") {
             return Err(BrowserError::Protocol(format!("JS exception: {exc}")));
